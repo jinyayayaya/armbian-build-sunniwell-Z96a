@@ -1,3 +1,15 @@
+From a49012a78c95691b7c1e3b480a5674f5516306b7 Mon Sep 17 00:00:00 2001
+From: jinyayayaya <jinyayayaya@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 20:57:42 +0800
+Subject: [PATCH] my fixes
+
+---
+ .../bindings/usb/hynetek,husb311.yaml         |   6 +
+ drivers/power/supply/bq25700_charger.c        | 671 +++++++++++++++---
+ drivers/power/supply/rk817_battery.c          |  82 ++-
+ drivers/usb/typec/tcpm/tcpci_husb311.c        |  42 +-
+ 4 files changed, 661 insertions(+), 140 deletions(-)
+
 diff --git a/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml b/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml
 index 4c2023054..a6d28def5 100644
 --- a/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml
@@ -16,7 +28,7 @@ index 4c2023054..a6d28def5 100644
      type: object
      properties:
 diff --git a/drivers/power/supply/bq25700_charger.c b/drivers/power/supply/bq25700_charger.c
-index d870f90ca..ef1eef826 100644
+index d67607cc9..ff8fa68df 100644
 --- a/drivers/power/supply/bq25700_charger.c
 +++ b/drivers/power/supply/bq25700_charger.c
 @@ -22,6 +22,7 @@
@@ -976,7 +988,7 @@ index d870f90ca..ef1eef826 100644
  	int ret = 0;
  	u32 i = 0;
  	int irq_flag;
-@@ -1968,11 +2362,15 @@ static int bq25700_probe(struct i2c_client *client,
+@@ -1968,11 +2362,17 @@ static int bq25700_probe(struct i2c_client *client,
  
  	charger->client = client;
  	charger->dev = dev;
@@ -984,8 +996,10 @@ index d870f90ca..ef1eef826 100644
  
  	charger_np = of_find_compatible_node(NULL, NULL, "ti,bq25700");
  	if (!charger_np)
- 		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8885");
+ 		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8886");
 -	if (charger_np) {
++	if (!charger_np)
++		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8885");
 +	use_bq25700 = !!charger_np;
 +	if (charger_np)
 +		of_node_put(charger_np);
@@ -993,7 +1007,7 @@ index d870f90ca..ef1eef826 100644
  		charger->regmap = devm_regmap_init_i2c(client,
  						       &bq25700_regmap_config);
  		if (IS_ERR(charger->regmap)) {
-@@ -2038,14 +2436,23 @@ static int bq25700_probe(struct i2c_client *client,
+@@ -2038,14 +2438,23 @@ static int bq25700_probe(struct i2c_client *client,
  	 * Make sure battery online, otherwise, writing INPUT_CURRENT and
  	 * CHARGE_CURRENT would make system power off
  	 */
@@ -1024,7 +1038,7 @@ index d870f90ca..ef1eef826 100644
  	}
  
  	ret = bq25700_hw_init(charger);
-@@ -2057,12 +2464,18 @@ static int bq25700_probe(struct i2c_client *client,
+@@ -2057,12 +2466,18 @@ static int bq25700_probe(struct i2c_client *client,
  	bq25700_parse_dt(charger);
  	bq25700_init_sysfs(charger);
  
@@ -1046,7 +1060,7 @@ index d870f90ca..ef1eef826 100644
  	}
  
  	if (bq25700_field_read(charger, AC_STAT))
-@@ -2077,20 +2490,51 @@ static int bq25700_probe(struct i2c_client *client,
+@@ -2077,20 +2492,51 @@ static int bq25700_probe(struct i2c_client *client,
  					irq_flag | IRQF_ONESHOT,
  					"bq25700_irq", charger);
  	if (ret)
@@ -1101,7 +1115,7 @@ index d870f90ca..ef1eef826 100644
  	vol_idx = bq25700_find_idx(DEFAULT_INPUTVOL, TBL_INPUTVOL);
  	bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
  	bq25700_field_write(charger, INPUT_CURRENT,
-@@ -2146,6 +2590,7 @@ static const struct of_device_id bq25700_of_match[] = {
+@@ -2144,6 +2590,7 @@ static const struct of_device_id bq25700_of_match[] = {
  
  static struct i2c_driver bq25700_driver = {
  	.probe		= bq25700_probe,
@@ -1110,10 +1124,10 @@ index d870f90ca..ef1eef826 100644
  	.id_table	= bq25700_i2c_ids,
  	.driver = {
 diff --git a/drivers/power/supply/rk817_battery.c b/drivers/power/supply/rk817_battery.c
-index dc5a25440..e304efb33 100644
+index 5b5b14a30..a1ed0bc0d 100644
 --- a/drivers/power/supply/rk817_battery.c
 +++ b/drivers/power/supply/rk817_battery.c
-@@ -628,6 +628,7 @@ struct rk817_battery_device {
+@@ -629,6 +629,7 @@ struct rk817_battery_device {
  };
  
  static void rk817_bat_resume_work(struct work_struct *work);
@@ -1121,7 +1135,7 @@ index dc5a25440..e304efb33 100644
  
  static u64 get_boot_sec(void)
  {
-@@ -1277,10 +1278,14 @@ static int rk817_bat_get_fcc(struct rk817_battery_device *battery)
+@@ -1290,10 +1291,14 @@ static int rk817_bat_get_fcc(struct rk817_battery_device *battery)
  static int rk817_bat_get_rsoc(struct rk817_battery_device *battery)
  {
  	int remain_cap;
@@ -1137,7 +1151,7 @@ index dc5a25440..e304efb33 100644
  }
  
  static int rk817_bat_get_off_count(struct rk817_battery_device *battery)
-@@ -1364,13 +1369,17 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
+@@ -1377,13 +1382,17 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
  	int status;
  
  	if (battery->chip_id == RK809_ID) {
@@ -1160,7 +1174,7 @@ index dc5a25440..e304efb33 100644
  			return CC_OR_CV_CHRG;
  		else
  			return CHRG_OFF;
-@@ -1378,7 +1387,7 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
+@@ -1391,7 +1400,7 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
  	status = rk817_bat_field_read(battery, CHG_STS);
  
  	if (status == CC_OR_CV_CHRG) {
@@ -1169,7 +1183,7 @@ index dc5a25440..e304efb33 100644
  			DBG("charge to finish\n");
  			status = CHARGE_FINISH;
  		}
-@@ -1422,7 +1431,7 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
+@@ -1435,7 +1444,7 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
   */
  static bool rk817_bat_fake_finish_mode(struct rk817_battery_device *battery)
  {
@@ -1178,7 +1192,7 @@ index dc5a25440..e304efb33 100644
  	    (rk817_bat_get_charge_status(battery) == CC_OR_CV_CHRG) &&
  	    (abs(battery->current_avg) <= 100))
  		return true;
-@@ -1595,6 +1604,12 @@ static void rk817_bat_init_dsoc_algorithm(struct rk817_battery_device *battery)
+@@ -1608,6 +1617,12 @@ static void rk817_bat_init_dsoc_algorithm(struct rk817_battery_device *battery)
  	    __func__, battery->sm_remain_cap, battery->smooth_soc);
  }
  
@@ -1191,7 +1205,7 @@ index dc5a25440..e304efb33 100644
  static void rk817_bat_first_pwron(struct rk817_battery_device *battery)
  {
  	battery->rsoc =
-@@ -1643,12 +1658,13 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
+@@ -1656,12 +1671,13 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
  	} else if (battery->is_ocv_calib) {
  		/* not initialized and poweroff_cnt above 30 min */
  		ocv_vol = rk817_bat_get_ocv_voltage(battery);
@@ -1207,7 +1221,7 @@ index dc5a25440..e304efb33 100644
  			battery->ocv_pre_dsoc = pre_soc;
  			battery->ocv_new_dsoc = ocv_soc;
  			battery->is_max_soc_offset = true;
-@@ -1659,11 +1675,11 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
+@@ -1672,11 +1688,11 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
  		BAT_INFO("OCV calib: cap=%d, rsoc=%d\n", ocv_cap, ocv_soc);
  	} else if (battery->pwroff_min > 0) {
  		ocv_vol = rk817_bat_get_ocv_voltage(battery);
@@ -1221,7 +1235,7 @@ index dc5a25440..e304efb33 100644
  			battery->is_force_calib = true;
  			BAT_INFO("dsoc force calib: %d -> %d\n",
  				 pre_soc, ocv_soc);
-@@ -2009,6 +2025,9 @@ static int rk817_bat_get_charge_state(struct rk817_battery_device *battery)
+@@ -2022,6 +2038,9 @@ static int rk817_bat_get_charge_state(struct rk817_battery_device *battery)
  	int ret;
  	struct power_supply *psy;
  
@@ -1231,7 +1245,7 @@ index dc5a25440..e304efb33 100644
  	if (!battery->usb_psy || !battery->ac_psy)
  		rk817_bat_get_chrg_psy(battery);
  
-@@ -2027,6 +2046,8 @@ static int rk817_bat_get_charge_state(struct rk817_battery_device *battery)
+@@ -2040,6 +2059,8 @@ static int rk817_bat_get_charge_state(struct rk817_battery_device *battery)
  		if (!ret)
  			battery->ac_in = val.intval;
  	}
@@ -1240,7 +1254,7 @@ index dc5a25440..e304efb33 100644
  
  	DBG("%s: ac_online=%d, usb_online=%d\n",
  	    __func__, battery->ac_in, battery->usb_in);
-@@ -2109,14 +2130,11 @@ static int rk817_battery_get_property(struct power_supply *psy,
+@@ -2122,14 +2143,11 @@ static int rk817_battery_get_property(struct power_supply *psy,
  	case POWER_SUPPLY_PROP_STATUS:
  		if (battery->pdata->bat_mode == MODE_VIRTUAL)
  			val->intval = VIRTUAL_STATUS;
@@ -1258,7 +1272,7 @@ index dc5a25440..e304efb33 100644
  				val->intval = POWER_SUPPLY_STATUS_CHARGING;
  			else
  				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-@@ -2339,6 +2357,28 @@ static void rk817_bat_update_info(struct rk817_battery_device *battery)
+@@ -2352,6 +2370,28 @@ static void rk817_bat_update_info(struct rk817_battery_device *battery)
  		battery->finish_base = get_boot_sec();
  }
  
@@ -1287,7 +1301,7 @@ index dc5a25440..e304efb33 100644
  static void rk817_bat_save_data(struct rk817_battery_device *battery)
  {
  	rk817_bat_save_dsoc(battery, battery->dsoc);
-@@ -2761,7 +2801,7 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
+@@ -2774,7 +2814,7 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
  	int plus_soc, finish_current, rest = 0;
  
  	/* rsoc */
@@ -1296,7 +1310,7 @@ index dc5a25440..e304efb33 100644
  	    (get_charge_status(battery) == CHARGE_FINISH)) {
  		battery->age_adjust_cap +=
  			(battery->fcc * 1000 - battery->remain_cap);
-@@ -2774,7 +2814,8 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
+@@ -2787,7 +2827,8 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
  		if (!battery->finish_base)
  			battery->finish_base = get_boot_sec();
  
@@ -1306,7 +1320,7 @@ index dc5a25440..e304efb33 100644
  					FINISH_CHRG_CUR2 : FINISH_CHRG_CUR1;
  		finish_sec = base2sec(battery->finish_base);
  
-@@ -2892,6 +2933,7 @@ static void rk817_battery_work(struct work_struct *work)
+@@ -2905,6 +2946,7 @@ static void rk817_battery_work(struct work_struct *work)
  
  	rk817_bat_update_info(battery);
  	rk817_bat_lowpwr_check(battery);
@@ -1417,3 +1431,6 @@ index faed6b65f..519cfe9dc 100644
  }
  
  static int husb311_pm_suspend(struct device *dev)
+-- 
+2.39.5
+
