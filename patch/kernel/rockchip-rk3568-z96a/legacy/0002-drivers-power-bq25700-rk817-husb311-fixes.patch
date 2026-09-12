@@ -1,0 +1,1419 @@
+diff --git a/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml b/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml
+index 4c2023054..a6d28def5 100644
+--- a/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml
++++ b/Documentation/devicetree/bindings/usb/hynetek,husb311.yaml
+@@ -20,6 +20,12 @@ properties:
+   interrupts:
+     maxItems: 1
+ 
++  switch-ctl-gpios:
++    maxItems: 1
++    description:
++      GPIO controlling an optional board-level switch in the USB-C path.
++      The switch is asserted while the HUSB311 is active.
++
+   ports:
+     type: object
+     properties:
+diff --git a/drivers/power/supply/bq25700_charger.c b/drivers/power/supply/bq25700_charger.c
+index d870f90ca..ef1eef826 100644
+--- a/drivers/power/supply/bq25700_charger.c
++++ b/drivers/power/supply/bq25700_charger.c
+@@ -22,6 +22,7 @@
+ #include <linux/extcon.h>
+ #include <linux/delay.h>
+ #include <linux/power_supply.h>
++#include <linux/mutex.h>
+ #include <linux/gpio.h>
+ #include <linux/of_gpio.h>
+ 
+@@ -49,6 +50,8 @@ module_param_named(dbg_level, dbg_enable, int, 0644);
+ #define MAX_OTGVOLTAGE			20800000
+ #define MIN_OTGVOLTAGE			4280000
+ #define MAX_OTGCURRENT			6350000
++#define BQ25700_STARTUP_SYNC_DELAY_MS	1000
++#define BQ25700_STARTUP_SYNC_MAX_ATTEMPTS	10
+ 
+ enum bq25700_fields {
+ 	EN_LWPWR, WDTWR_ADJ, IDPM_AUTO_DISABLE,
+@@ -166,16 +169,29 @@ struct bq25700_device {
+ 	struct notifier_block		nb;
+ 	struct bq2570x_platform_data	plat_data;
+ 	struct device_node		*notify_node;
++	struct mutex			sync_lock;
+ 	struct workqueue_struct		*usb_charger_wq;
+-	struct workqueue_struct		*dc_charger_wq;
+-	struct workqueue_struct		*finish_sig_wq;
+ 	struct delayed_work		usb_work;
+ 	struct delayed_work		host_work;
+ 	struct delayed_work		discnt_work;
+ 	struct delayed_work		usb_work1;
+ 	struct delayed_work		host_work1;
+-	struct delayed_work		discnt_work1;
+-	struct delayed_work		irq_work;
++	struct delayed_work		startup_sync_work;
++	struct delayed_work		resume_charge_work;
++	unsigned int			startup_sync_attempts;
++	bool				works_initialized;
++	bool				startup_sync_done;
++	bool				shutting_down;
++	bool				pd_notifier_registered;
++	bool				cable_cg_registered;
++	bool				cable_cg1_registered;
++	bool				bc_notifier_registered;
++	bool				cable_host_registered;
++	bool				cable_host1_registered;
++	bool				sysfs_registered;
++	bool				irq_requested;
++	bool				irq_wake_enabled;
++	bool				irq_disabled;
+ 	struct notifier_block		cable_cg_nb;
+ 	struct notifier_block		cable_host_nb;
+ 	struct notifier_block		cable_cg_nb1;
+@@ -601,8 +617,10 @@ static const struct regmap_config bq25703_regmap_config = {
+ };
+ 
+ static void bq25700_disable_charge(struct bq25700_device *charger);
++static void bq25700_enable_typec0(struct bq25700_device *charger);
+ 
+ static struct bq25700_device *bq25700_charger;
++static DEFINE_MUTEX(bq25700_charger_lock);
+ 
+ static int bq25700_field_read(struct bq25700_device *charger,
+ 			      enum bq25700_fields field_id)
+@@ -838,12 +856,28 @@ static void bq25700_init_sysfs(struct bq25700_device *charger)
+ 	for (i = 0; i < ARRAY_SIZE(bq25700_charger_attr); i++) {
+ 		ret = sysfs_create_file(&charger->dev->kobj,
+ 					&bq25700_charger_attr[i].attr);
+-		if (ret)
++		if (ret) {
+ 			dev_err(charger->dev, "create charger node(%s) error\n",
+ 				bq25700_charger_attr[i].attr.name);
++			continue;
++		}
++		charger->sysfs_registered = true;
+ 	}
+ }
+ 
++static void bq25700_remove_sysfs(struct bq25700_device *charger)
++{
++	int i;
++
++	if (!charger->sysfs_registered)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(bq25700_charger_attr); i++)
++		sysfs_remove_file(&charger->dev->kobj,
++				  &bq25700_charger_attr[i].attr);
++	charger->sysfs_registered = false;
++}
++
+ static u32 bq25700_find_idx(u32 value, enum bq25700_table_ids id)
+ {
+ 	u32 idx;
+@@ -860,29 +894,45 @@ static u32 bq25700_find_idx(u32 value, enum bq25700_table_ids id)
+ 	return idx - 1;
+ }
+ 
++static u32 bq25700_input_voltage_idx(u32 voltage)
++{
++	if (voltage > 1280000)
++		voltage -= 1280000;
++	else
++		voltage = 0;
++
++	return bq25700_find_idx(voltage, TBL_INPUTVOL);
++}
++
+ void bq25700_charger_set_current(unsigned long event,
+ 				 int current_value)
+ {
++	struct bq25700_device *charger;
+ 	int idx;
+ 
+-	if (!bq25700_charger) {
++	mutex_lock(&bq25700_charger_lock);
++	charger = bq25700_charger;
++	if (!charger) {
++		mutex_unlock(&bq25700_charger_lock);
+ 		pr_err("[%s,%d] bq25700_charger is null\n", __func__, __LINE__);
+ 		return;
+ 	}
+ 	switch (event) {
+ 	case CHARGER_CURRENT_EVENT:
+ 		idx = bq25700_find_idx(current_value, TBL_ICHG);
+-		bq25700_field_write(bq25700_charger, CHARGE_CURRENT, idx);
++		bq25700_field_write(charger, CHARGE_CURRENT, idx);
+ 		break;
+ 
+ 	case INPUT_CURRENT_EVENT:
+ 		idx = bq25700_find_idx(current_value, TBL_INPUTCUR);
+-		bq25700_field_write(bq25700_charger, INPUT_CURRENT, idx);
++		bq25700_field_write(charger, INPUT_CURRENT, idx);
+ 		break;
+ 
+ 	default:
++		mutex_unlock(&bq25700_charger_lock);
+ 		return;
+ 	}
++	mutex_unlock(&bq25700_charger_lock);
+ }
+ 
+ static int bq25700_fw_read_u32_props(struct bq25700_device *charger)
+@@ -1245,15 +1295,150 @@ static int bq25700_power_supply_init(struct bq25700_device *charger)
+ 	psy_cfg.of_node = charger->dev->of_node;
+ 
+ 	charger->supply_charger =
+-		power_supply_register(charger->dev,
+-				      &bq25700_power_supply_desc,
+-				      &psy_cfg);
++		devm_power_supply_register(charger->dev,
++					   &bq25700_power_supply_desc,
++					   &psy_cfg);
+ 
+ 	return PTR_ERR_OR_ZERO(charger->supply_charger);
+ }
+ 
++static bool bq25700_notify_psy_matches(struct bq25700_device *charger,
++					       struct power_supply *psy)
++{
++	if (charger->notify_node)
++		return psy->dev.parent &&
++			psy->dev.parent->of_node == charger->notify_node;
++
++	return charger->plat_data.notify_device &&
++		!strcmp(psy->desc->name, charger->plat_data.notify_device);
++}
++
+ static void bq25700_discnt(struct bq25700_device *charger, enum tpyec_port_t port);
+ 
++static int bq25700_sync_pd(struct bq25700_device *charger)
++{
++	struct power_supply *notify_psy = NULL;
++	union power_supply_propval online;
++	union power_supply_propval current_limit;
++	union power_supply_propval voltage;
++	struct bq25700_state state;
++	int cur_idx, vol_idx;
++	int ret;
++
++	mutex_lock(&charger->sync_lock);
++	if (charger->shutting_down) {
++		ret = -ESHUTDOWN;
++		goto out_unlock;
++	}
++
++	if (charger->notify_node) {
++		notify_psy = power_supply_get_by_phandle(charger->dev->of_node,
++							  "ti,usb-charger-detection");
++	}
++	if (IS_ERR_OR_NULL(notify_psy) && charger->plat_data.notify_device) {
++		notify_psy = power_supply_get_by_name(
++						charger->plat_data.notify_device);
++	}
++
++	if (IS_ERR_OR_NULL(notify_psy)) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++
++	ret = power_supply_get_property(notify_psy, POWER_SUPPLY_PROP_ONLINE,
++					       &online);
++	if (ret)
++		goto out_put;
++	if (!online.intval) {
++		ret = -ENOTCONN;
++		goto out_put;
++	}
++
++	ret = power_supply_get_property(notify_psy,
++					       POWER_SUPPLY_PROP_CURRENT_MAX,
++					       &current_limit);
++	if (ret)
++		goto out_put;
++
++	ret = power_supply_get_property(notify_psy,
++					       POWER_SUPPLY_PROP_VOLTAGE_NOW,
++					       &voltage);
++	if (ret)
++		goto out_put;
++
++	if (current_limit.intval <= 0 || voltage.intval <= 0) {
++		ret = -EAGAIN;
++		goto out_put;
++	}
++
++	cur_idx = bq25700_find_idx(current_limit.intval, TBL_INPUTCUR);
++	vol_idx = bq25700_input_voltage_idx(voltage.intval);
++	ret = bq25700_field_write(charger, INPUT_CURRENT, cur_idx);
++	if (ret)
++		goto out_put;
++	ret = bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
++	if (ret)
++		goto out_put;
++	ret = bq25700_field_write(charger, CHARGE_CURRENT,
++					 charger->init_data.ichg);
++	if (ret)
++		goto out_put;
++
++	ret = bq25700_get_chip_state(charger, &state);
++	if (ret)
++		goto out_put;
++	charger->state = state;
++	WRITE_ONCE(charger->startup_sync_done, true);
++	power_supply_changed(charger->supply_charger);
++	dev_info(charger->dev,
++		 "startup PD sync: INPUT_CURRENT:%d, INPUT_VOLTAGE:%d, CHARGE_CURRENT:%d\n",
++		 cur_idx, vol_idx, charger->init_data.ichg);
++
++out_put:
++	power_supply_put(notify_psy);
++	out_unlock:
++	mutex_unlock(&charger->sync_lock);
++	return ret;
++}
++
++static void bq25700_startup_sync_worker(struct work_struct *work)
++{
++	struct bq25700_device *charger = container_of(work,
++							      struct bq25700_device,
++							      startup_sync_work.work);
++	int ret;
++
++	if (READ_ONCE(charger->shutting_down) || charger->automode != 1)
++		return;
++
++	ret = bq25700_sync_pd(charger);
++	if (!ret)
++		return;
++
++	if (READ_ONCE(charger->shutting_down) ||
++	    READ_ONCE(charger->startup_sync_done))
++		return;
++
++	charger->startup_sync_attempts++;
++	if (charger->startup_sync_attempts < BQ25700_STARTUP_SYNC_MAX_ATTEMPTS &&
++	    !READ_ONCE(charger->shutting_down)) {
++		queue_delayed_work(charger->usb_charger_wq,
++				   &charger->startup_sync_work,
++					   msecs_to_jiffies(BQ25700_STARTUP_SYNC_DELAY_MS));
++		return;
++	}
++
++	if (ret != -ENOTCONN && ret != -ENODEV)
++		dev_warn(charger->dev,
++			 "startup PD sync did not observe a valid input after %u attempts: %d\n",
++			 charger->startup_sync_attempts, ret);
++
++	if (charger->works_initialized && charger->usb_charger_wq &&
++	    bq25700_field_read(charger, AC_STAT))
++		queue_delayed_work(charger->usb_charger_wq,
++				   &charger->resume_charge_work, 0);
++}
++
+ static int bq2570x_pd_notifier_call(struct notifier_block *nb,
+ 		unsigned long val, void *v)
+ {
+@@ -1265,30 +1450,28 @@ static int bq2570x_pd_notifier_call(struct notifier_block *nb,
+ 	int ret;
+ 	int vol_idx, cur_idx, chr_idx;
+ 
++	if (READ_ONCE(bq->shutting_down))
++		return NOTIFY_OK;
++
+ 	if (val != PSY_EVENT_PROP_CHANGED)
+ 		return NOTIFY_OK;
+ 
+ 	/* Ignore event if it was not send by notify_node/notify_device */
+-	if (bq->notify_node) {
+-		if (!psy->dev.parent ||
+-		    psy->dev.parent->of_node != bq->notify_node)
+-			return NOTIFY_OK;
+-	} else if (bq->plat_data.notify_device) {
+-		if (strcmp(psy->desc->name, bq->plat_data.notify_device) != 0)
+-			return NOTIFY_OK;
+-	}
++	if (!bq25700_notify_psy_matches(bq, psy))
++		return NOTIFY_OK;
+ 
+ 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &prop);
+ 	if (ret != 0)
+ 		return NOTIFY_OK;
+ 	/* online=0: USB out */
+ 	if (prop.intval == 0) {
+-		queue_delayed_work(bq->usb_charger_wq, &bq->discnt_work,
+-				   msecs_to_jiffies(10));
++		if (!READ_ONCE(bq->shutting_down))
++			queue_delayed_work(bq->usb_charger_wq, &bq->discnt_work,
++					   msecs_to_jiffies(10));
+ 		return NOTIFY_OK;
+ 	}
+ 
+-	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &prop);
++	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_MAX, &prop);
+ 	if (ret != 0)
+ 		return NOTIFY_OK;
+ 	if (prop.intval > 0) {
+@@ -1297,13 +1480,10 @@ static int bq2570x_pd_notifier_call(struct notifier_block *nb,
+ 						&prop);
+ 		if (ret != 0)
+ 			return NOTIFY_OK;
+-		vol_idx = bq25700_find_idx((prop.intval - 1280000 - 3200000), TBL_INPUTVOL);
+-		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW,
+-						&prop);
+-		if (ret != 0)
+-			return NOTIFY_OK;
+-		chr_idx = bq25700_find_idx(prop.intval, TBL_ICHG);
++		vol_idx = bq25700_input_voltage_idx(prop.intval);
++		chr_idx = bq->init_data.ichg;
+ 
++		mutex_lock(&bq->sync_lock);
+ 		bq25700_field_write(bq, INPUT_CURRENT, cur_idx);
+ 		bq25700_field_write(bq, INPUT_VOLTAGE, vol_idx);
+ 		bq25700_field_write(bq, CHARGE_CURRENT, chr_idx);
+@@ -1312,11 +1492,74 @@ static int bq2570x_pd_notifier_call(struct notifier_block *nb,
+ 
+ 		bq25700_get_chip_state(bq, &state);
+ 		bq->state = state;
++		WRITE_ONCE(bq->startup_sync_done, true);
+ 		power_supply_changed(bq->supply_charger);
++		mutex_unlock(&bq->sync_lock);
++		cancel_delayed_work_sync(&bq->startup_sync_work);
+ 	}
+ 	return NOTIFY_OK;
+ }
+ 
++static void bq25700_resume_charge_worker(struct work_struct *work)
++{
++	struct bq25700_device *charger = container_of(work,
++						      struct bq25700_device,
++						      resume_charge_work.work);
++	struct bq25700_state state;
++	int ret;
++
++	if (READ_ONCE(charger->shutting_down))
++		return;
++
++	/* If a PD source can supply power parameters, let it take precedence */
++	ret = bq25700_sync_pd(charger);
++	if (ret == 0) {
++		dev_info(charger->dev, "charge resumed via PD sync\n");
++		return;
++	}
++
++	mutex_lock(&charger->sync_lock);
++	if (charger->shutting_down) {
++		mutex_unlock(&charger->sync_lock);
++		return;
++	}
++
++	if (!bq25700_field_read(charger, AC_STAT)) {
++		mutex_unlock(&charger->sync_lock);
++		return;
++	}
++
++	ret = bq25700_get_chip_state(charger, &state);
++	if (ret) {
++		mutex_unlock(&charger->sync_lock);
++		return;
++	}
++
++	if (state.fault_acov || state.fault_batoc || state.fault_acoc ||
++	    state.fault_latchoff || state.in_otg) {
++		dev_warn(charger->dev,
++			 "charge resume inhibited: fault/otg active\n");
++		mutex_unlock(&charger->sync_lock);
++		return;
++	}
++
++	bq25700_enable_typec0(charger);
++	bq25700_field_write(charger, INPUT_CURRENT,
++			    charger->init_data.input_current_sdp);
++	bq25700_field_write(charger, CHARGE_CURRENT,
++			    charger->init_data.ichg);
++
++	bq25700_get_chip_state(charger, &state);
++	charger->state = state;
++	power_supply_changed(charger->supply_charger);
++
++	dev_info(charger->dev,
++		 "charge auto-resumed on AC_STAT: INPUT_CURRENT=%d, CHARGE_CURRENT=%d\n",
++		 charger->init_data.input_current_sdp, charger->init_data.ichg);
++
++	mutex_unlock(&charger->sync_lock);
++}
++
+ static irqreturn_t bq25700_irq_handler_thread(int irq, void *private)
+ {
+ 	struct bq25700_device *charger = private;
+@@ -1325,8 +1568,17 @@ static irqreturn_t bq25700_irq_handler_thread(int irq, void *private)
+ 
+ 	if (bq25700_field_read(charger, AC_STAT)) {
+ 		irq_flag = IRQF_TRIGGER_LOW;
++		bq25700_get_chip_state(charger, &state);
++		charger->state = state;
++		power_supply_changed(charger->supply_charger);
++		if (charger->works_initialized && charger->usb_charger_wq)
++			queue_delayed_work(charger->usb_charger_wq,
++					   &charger->resume_charge_work,
++					   msecs_to_jiffies(300));
+ 	} else {
+ 		irq_flag = IRQF_TRIGGER_HIGH;
++		if (charger->works_initialized)
++			cancel_delayed_work(&charger->resume_charge_work);
+ 		bq25700_field_write(charger, INPUT_CURRENT,
+ 				    charger->init_data.input_current_sdp);
+ 		bq25700_disable_charge(charger);
+@@ -1464,6 +1716,9 @@ static void bq25700_charger_evt_worker(struct work_struct *work)
+ 				struct bq25700_device, usb_work.work);
+ 	struct extcon_dev *edev = charger->cable_edev;
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return;
++
+ 	if (charger->usb_bc == 0)
+ 		bq25700_charger_evt_handel(charger, edev, USB_TYPEC_0);
+ 	else
+@@ -1476,6 +1731,9 @@ static void bq25700_charger_evt_worker1(struct work_struct *work)
+ 				struct bq25700_device, usb_work1.work);
+ 	struct extcon_dev *edev = charger->cable_edev_1;
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return;
++
+ 	bq25700_charger_evt_handel(charger, edev, USB_TYPEC_1);
+ }
+ 
+@@ -1485,6 +1743,8 @@ static int bq25700_charger_evt_notifier(struct notifier_block *nb,
+ {
+ 	struct bq25700_device *charger =
+ 		container_of(nb, struct bq25700_device, cable_cg_nb);
++	if (READ_ONCE(charger->shutting_down))
++		return NOTIFY_DONE;
+ 	charger->bc_event = event;
+ 	queue_delayed_work(charger->usb_charger_wq, &charger->usb_work,
+ 			   msecs_to_jiffies(10));
+@@ -1499,6 +1759,9 @@ static int bq25700_charger_evt_notifier1(struct notifier_block *nb,
+ 	struct bq25700_device *charger =
+ 		container_of(nb, struct bq25700_device, cable_cg_nb1);
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return NOTIFY_DONE;
++
+ 	queue_delayed_work(charger->usb_charger_wq, &charger->usb_work1,
+ 			   msecs_to_jiffies(10));
+ 
+@@ -1520,6 +1783,9 @@ static void bq25700_host_evt_worker(struct work_struct *work)
+ 		container_of(work, struct bq25700_device, host_work.work);
+ 	struct extcon_dev *edev = charger->cable_edev;
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return;
++
+ 	if (extcon_get_state(edev, EXTCON_USB_VBUS_EN) > 0)
+ 		bq25700_set_otg_vbus(charger, true);
+ 	else if (extcon_get_state(edev, EXTCON_USB_VBUS_EN) == 0)
+@@ -1532,6 +1798,9 @@ static void bq25700_host_evt_worker1(struct work_struct *work)
+ 		container_of(work, struct bq25700_device, host_work1.work);
+ 	struct extcon_dev *edev = charger->cable_edev_1;
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return;
++
+ 	if (extcon_get_state(edev, EXTCON_USB_VBUS_EN) > 0)
+ 		bq25700_set_otg_vbus(charger, true);
+ 	else if (extcon_get_state(edev, EXTCON_USB_VBUS_EN) == 0)
+@@ -1544,6 +1813,9 @@ static int bq25700_host_evt_notifier(struct notifier_block *nb,
+ 	struct bq25700_device *charger =
+ 		container_of(nb, struct bq25700_device, cable_host_nb);
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return NOTIFY_DONE;
++
+ 	queue_delayed_work(charger->usb_charger_wq, &charger->host_work,
+ 			   msecs_to_jiffies(10));
+ 
+@@ -1556,6 +1828,9 @@ static int bq25700_host_evt_notifier1(struct notifier_block *nb,
+ 	struct bq25700_device *charger =
+ 		container_of(nb, struct bq25700_device, cable_host_nb1);
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return NOTIFY_DONE;
++
+ 	queue_delayed_work(charger->usb_charger_wq, &charger->host_work1,
+ 			   msecs_to_jiffies(10));
+ 
+@@ -1594,6 +1869,9 @@ static void bq25700_discnt_evt_worker(struct work_struct *work)
+ 						      struct bq25700_device,
+ 						      discnt_work.work);
+ 
++	if (READ_ONCE(charger->shutting_down))
++		return;
++
+ 	bq25700_discnt(charger, USB_TYPEC_0);
+ }
+ 
+@@ -1608,7 +1886,7 @@ static int bq25700_register_cg_extcon(struct bq25700_device *charger,
+ 				       able_cg_nb);
+ 	if (ret < 0) {
+ 		dev_err(charger->dev, "failed to register notifier for SDP\n");
+-		return -1;
++		return ret;
+ 	}
+ 
+ 	ret = extcon_register_notifier(edev,
+@@ -1616,7 +1894,9 @@ static int bq25700_register_cg_extcon(struct bq25700_device *charger,
+ 				       able_cg_nb);
+ 	if (ret < 0) {
+ 		dev_err(charger->dev, "failed to register notifier for DCP\n");
+-		return -1;
++		extcon_unregister_notifier(edev, EXTCON_CHG_USB_SDP,
++					   able_cg_nb);
++		return ret;
+ 	}
+ 
+ 	ret = extcon_register_notifier(edev,
+@@ -1624,12 +1904,24 @@ static int bq25700_register_cg_extcon(struct bq25700_device *charger,
+ 				       able_cg_nb);
+ 	if (ret < 0) {
+ 		dev_err(charger->dev, "failed to register notifier for CDP\n");
+-		return -1;
++		extcon_unregister_notifier(edev, EXTCON_CHG_USB_DCP,
++					   able_cg_nb);
++		extcon_unregister_notifier(edev, EXTCON_CHG_USB_SDP,
++					   able_cg_nb);
++		return ret;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static void bq25700_unregister_cg_extcon(struct extcon_dev *edev,
++					 struct notifier_block *nb)
++{
++	extcon_unregister_notifier(edev, EXTCON_CHG_USB_SDP, nb);
++	extcon_unregister_notifier(edev, EXTCON_CHG_USB_DCP, nb);
++	extcon_unregister_notifier(edev, EXTCON_CHG_USB_CDP, nb);
++}
++
+ static int bq25700_register_cg_nb(struct bq25700_device *charger)
+ {
+ 	enum bc_port_type bc_type;
+@@ -1638,26 +1930,32 @@ static int bq25700_register_cg_nb(struct bq25700_device *charger)
+ 	if (charger->usb_bc == 0) {
+ 		if (charger->cable_edev) {
+ 			/* Register chargers  */
+-			INIT_DELAYED_WORK(&charger->usb_work,
+-					  bq25700_charger_evt_worker);
+ 			charger->cable_cg_nb.notifier_call =
+ 				bq25700_charger_evt_notifier;
+-			bq25700_register_cg_extcon(charger, charger->cable_edev,
+-						   &charger->cable_cg_nb);
++			ret = bq25700_register_cg_extcon(charger, charger->cable_edev,
++							&charger->cable_cg_nb);
++			if (ret)
++				return ret;
++			charger->cable_cg_registered = true;
+ 		}
+ 
+ 		if (charger->cable_edev_1) {
+-			INIT_DELAYED_WORK(&charger->usb_work1,
+-					  bq25700_charger_evt_worker1);
+ 			charger->cable_cg_nb1.notifier_call =
+ 				bq25700_charger_evt_notifier1;
+-			bq25700_register_cg_extcon(charger,
+-						   charger->cable_edev_1,
+-						   &charger->cable_cg_nb1);
++			ret = bq25700_register_cg_extcon(charger,
++							charger->cable_edev_1,
++							&charger->cable_cg_nb1);
++			if (ret) {
++				if (charger->cable_cg_registered) {
++					bq25700_unregister_cg_extcon(charger->cable_edev,
++								     &charger->cable_cg_nb);
++					charger->cable_cg_registered = false;
++				}
++				return ret;
++			}
++			charger->cable_cg1_registered = true;
+ 		}
+ 	} else {
+-		INIT_DELAYED_WORK(&charger->usb_work,
+-				  bq25700_charger_evt_worker);
+ 		charger->cable_cg_nb.notifier_call =
+ 			bq25700_charger_evt_notifier;
+ 
+@@ -1665,28 +1963,25 @@ static int bq25700_register_cg_nb(struct bq25700_device *charger)
+ 						     &bc_type);
+ 		if (ret) {
+ 			dev_err(charger->dev, "failed to register notifier for bc\n");
+-			return -EINVAL;
++			return ret;
+ 		}
++		charger->bc_notifier_registered = true;
+ 	}
+ 	return 0;
+ }
+ 
+ static int bq25700_register_pd_nb(struct bq25700_device *charger)
+ {
+-	struct power_supply *notify_psy = NULL;
+-	int vol_idx, cur_idx;
+ 	int ret;
+-	union power_supply_propval prop;
+ 
+ 	if (charger->notify_node || charger->plat_data.notify_device) {
+-		INIT_DELAYED_WORK(&charger->discnt_work,
+-				  bq25700_discnt_evt_worker);
+ 		charger->nb.notifier_call = bq2570x_pd_notifier_call;
+ 		ret = power_supply_reg_notifier(&charger->nb);
+ 		if (ret) {
+ 			dev_err(charger->dev, "failed to reg notifier: %d\n", ret);
+ 			return ret;
+ 		}
++		charger->pd_notifier_registered = true;
+ 		charger->automode = 1;
+ 		dev_info(charger->dev, "automode supported, waiting for events\n");
+ 	} else {
+@@ -1695,37 +1990,9 @@ static int bq25700_register_pd_nb(struct bq25700_device *charger)
+ 	}
+ 
+ 	if (charger->nb.notifier_call) {
+-		if (charger->dev->of_node) {
+-			notify_psy = power_supply_get_by_phandle(charger->dev->of_node,
+-							"ti,usb-charger-detection");
+-			if (IS_ERR_OR_NULL(notify_psy)) {
+-				dev_info(charger->dev, "bq25700 notify_psy is error\n");
+-				notify_psy = NULL;
+-			}
+-		} else if (charger->plat_data.notify_device) {
+-			notify_psy = power_supply_get_by_name(
+-						charger->plat_data.notify_device);
+-		}
+-	}
+-
+-	if (notify_psy) {
+-		ret = power_supply_get_property(notify_psy,
+-					POWER_SUPPLY_PROP_CURRENT_MAX, &prop);
+-		if (ret != 0)
+-			return ret;
+-		ret = power_supply_get_property(notify_psy,
+-					POWER_SUPPLY_PROP_VOLTAGE_MAX, &prop);
+-		if (ret != 0)
++		ret = bq25700_sync_pd(charger);
++		if (ret && ret != -EAGAIN && ret != -ENOTCONN && ret != -ENODEV)
+ 			return ret;
+-
+-		cur_idx = bq25700_find_idx(prop.intval, TBL_INPUTCUR);
+-		vol_idx = bq25700_find_idx((prop.intval - 1280000 - 3200000), TBL_INPUTVOL);
+-		bq25700_field_write(charger, INPUT_CURRENT, cur_idx);
+-		bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
+-		bq25700_field_write(charger, CHARGE_CURRENT,
+-				    charger->init_data.ichg);
+-		dev_info(charger->dev, "INPUT_CURRENT:%d, INPUT_VOLTAGE:%d, CHARGE_CURRENT:%d\n",
+-				 cur_idx, vol_idx, charger->init_data.ichg);
+ 	}
+ 
+ 	return 0;
+@@ -1737,7 +2004,6 @@ static int bq25700_register_host_nb(struct bq25700_device *charger)
+ 
+ 	/* Register host */
+ 	if (charger->cable_edev) {
+-		INIT_DELAYED_WORK(&charger->host_work, bq25700_host_evt_worker);
+ 		charger->cable_host_nb.notifier_call =
+ 			bq25700_host_evt_notifier;
+ 		ret = extcon_register_notifier(charger->cable_edev,
+@@ -1746,13 +2012,12 @@ static int bq25700_register_host_nb(struct bq25700_device *charger)
+ 		if (ret < 0) {
+ 			dev_err(charger->dev,
+ 				"failed to register notifier for HOST\n");
+-			return -1;
++			return ret;
+ 		}
++		charger->cable_host_registered = true;
+ 	}
+ 
+ 	if (charger->cable_edev_1) {
+-		INIT_DELAYED_WORK(&charger->host_work1,
+-				  bq25700_host_evt_worker1);
+ 		charger->cable_host_nb1.notifier_call =
+ 			bq25700_host_evt_notifier1;
+ 		ret = extcon_register_notifier(charger->cable_edev_1,
+@@ -1761,8 +2026,15 @@ static int bq25700_register_host_nb(struct bq25700_device *charger)
+ 		if (ret < 0) {
+ 			dev_err(charger->dev,
+ 				"failed to register notifier for HOST\n");
+-			return -1;
++			if (charger->cable_host_registered) {
++				extcon_unregister_notifier(charger->cable_edev,
++							    EXTCON_USB_VBUS_EN,
++							    &charger->cable_host_nb);
++				charger->cable_host_registered = false;
++			}
++			return ret;
+ 		}
++		charger->cable_host1_registered = true;
+ 	}
+ 
+ 	return 0;
+@@ -1820,6 +2092,7 @@ static int bq25700_register_otg_vbus_regulator(struct bq25700_device *charger)
+ {
+ 	struct device_node *np;
+ 	struct regulator_config config = { };
++	int ret;
+ 
+ 	np = of_get_child_by_name(charger->dev->of_node, "regulators");
+ 	if (!np) {
+@@ -1833,25 +2106,44 @@ static int bq25700_register_otg_vbus_regulator(struct bq25700_device *charger)
+ 	charger->otg_vbus_reg = devm_regulator_register(charger->dev,
+ 							&bq25700_otg_vbus_desc,
+ 							&config);
+-	if (IS_ERR(charger->otg_vbus_reg))
+-		return PTR_ERR(charger->otg_vbus_reg);
++	ret = PTR_ERR_OR_ZERO(charger->otg_vbus_reg);
++	of_node_put(np);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+ 
+-static long bq25700_init_usb(struct bq25700_device *charger)
++static int bq25700_init_usb(struct bq25700_device *charger)
+ {
+ 	struct extcon_dev *edev, *edev1;
+ 	struct device *dev = charger->dev;
++	int ret;
+ 
+ 	charger->usb_charger_wq = alloc_ordered_workqueue("%s",
+ 							  WQ_MEM_RECLAIM |
+ 							  WQ_FREEZABLE,
+ 							  "bq25700-usb-wq");
++	if (!charger->usb_charger_wq)
++		return -ENOMEM;
++
++	INIT_DELAYED_WORK(&charger->usb_work, bq25700_charger_evt_worker);
++	INIT_DELAYED_WORK(&charger->usb_work1, bq25700_charger_evt_worker1);
++	INIT_DELAYED_WORK(&charger->host_work, bq25700_host_evt_worker);
++	INIT_DELAYED_WORK(&charger->host_work1, bq25700_host_evt_worker1);
++	INIT_DELAYED_WORK(&charger->discnt_work, bq25700_discnt_evt_worker);
++	INIT_DELAYED_WORK(&charger->startup_sync_work,
++				  bq25700_startup_sync_worker);
++	INIT_DELAYED_WORK(&charger->resume_charge_work,
++			  bq25700_resume_charge_worker);
++	charger->works_initialized = true;
++
+ 	/* type-C */
+ 	edev = extcon_get_edev_by_phandle(dev, 0);
+ 	if (IS_ERR(edev)) {
+-		if (PTR_ERR(edev) != -EPROBE_DEFER)
++		if (PTR_ERR(edev) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		else
+ 			dev_err(dev, "Invalid or missing extcon dev0\n");
+ 		charger->cable_edev = NULL;
+ 	} else {
+@@ -1860,7 +2152,9 @@ static long bq25700_init_usb(struct bq25700_device *charger)
+ 
+ 	edev1 = extcon_get_edev_by_phandle(dev, 1);
+ 	if (IS_ERR(edev1)) {
+-		if (PTR_ERR(edev1) != -EPROBE_DEFER)
++		if (PTR_ERR(edev1) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		else
+ 			dev_err(dev, "Invalid or missing extcon dev1\n");
+ 		charger->cable_edev_1 = NULL;
+ 	} else {
+@@ -1870,34 +2164,133 @@ static long bq25700_init_usb(struct bq25700_device *charger)
+ 	bq25700_field_write(charger, INPUT_CURRENT,
+ 			    charger->init_data.input_current_sdp);
+ 
+-	if (!charger->pd_charge_only)
+-		bq25700_register_cg_nb(charger);
++	if (!charger->pd_charge_only) {
++		ret = bq25700_register_cg_nb(charger);
++		if (ret)
++			return ret;
++	}
+ 
+-	if (bq25700_register_otg_vbus_regulator(charger) < 0) {
++	ret = bq25700_register_otg_vbus_regulator(charger);
++	if (ret < 0) {
++		if (ret == -EPROBE_DEFER)
++			return ret;
+ 		dev_warn(charger->dev,
+-			 "Cannot register otg vbus regulator\n");
++			"Cannot register otg vbus regulator\n");
+ 		charger->otg_vbus_reg = NULL;
+-		bq25700_register_host_nb(charger);
++		ret = bq25700_register_host_nb(charger);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	bq25700_register_pd_nb(charger);
++	ret = bq25700_register_pd_nb(charger);
++	if (ret)
++		return ret;
+ 
+ 	if (charger->cable_edev) {
+ 		if (!charger->otg_vbus_reg)
+-			schedule_delayed_work(&charger->host_work, 0);
++			queue_delayed_work(charger->usb_charger_wq,
++					   &charger->host_work, 0);
+ 		if (!charger->pd_charge_only)
+-			schedule_delayed_work(&charger->usb_work, 0);
++			queue_delayed_work(charger->usb_charger_wq,
++					   &charger->usb_work, 0);
+ 	}
+ 	if (charger->cable_edev_1) {
+ 		if (!charger->otg_vbus_reg)
+-			schedule_delayed_work(&charger->host_work1, 0);
++			queue_delayed_work(charger->usb_charger_wq,
++					   &charger->host_work1, 0);
+ 		if (!charger->pd_charge_only)
+-			schedule_delayed_work(&charger->usb_work1, 0);
++			queue_delayed_work(charger->usb_charger_wq,
++					   &charger->usb_work1, 0);
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static void bq25700_unregister_notifiers(struct bq25700_device *charger)
++{
++	if (charger->pd_notifier_registered) {
++		power_supply_unreg_notifier(&charger->nb);
++		charger->pd_notifier_registered = false;
++	}
++
++	if (charger->cable_cg_registered) {
++		bq25700_unregister_cg_extcon(charger->cable_edev,
++					     &charger->cable_cg_nb);
++		charger->cable_cg_registered = false;
++	}
++	if (charger->cable_cg1_registered) {
++		bq25700_unregister_cg_extcon(charger->cable_edev_1,
++					     &charger->cable_cg_nb1);
++		charger->cable_cg1_registered = false;
++	}
++	if (charger->bc_notifier_registered) {
++		rk_bc_detect_notifier_unregister(&charger->cable_cg_nb);
++		charger->bc_notifier_registered = false;
++	}
++	if (charger->cable_host_registered) {
++		extcon_unregister_notifier(charger->cable_edev,
++					    EXTCON_USB_VBUS_EN,
++					    &charger->cable_host_nb);
++		charger->cable_host_registered = false;
++	}
++	if (charger->cable_host1_registered) {
++		extcon_unregister_notifier(charger->cable_edev_1,
++					    EXTCON_USB_VBUS_EN,
++					    &charger->cable_host_nb1);
++		charger->cable_host1_registered = false;
++	}
++
++	charger->nb.notifier_call = NULL;
++	charger->cable_cg_nb.notifier_call = NULL;
++	charger->cable_cg_nb1.notifier_call = NULL;
++	charger->cable_host_nb.notifier_call = NULL;
++	charger->cable_host_nb1.notifier_call = NULL;
++}
++
++static void bq25700_cancel_works(struct bq25700_device *charger)
++{
++	if (!charger->works_initialized)
++		return;
++
++	cancel_delayed_work_sync(&charger->resume_charge_work);
++	cancel_delayed_work_sync(&charger->startup_sync_work);
++	cancel_delayed_work_sync(&charger->usb_work);
++	cancel_delayed_work_sync(&charger->usb_work1);
++	cancel_delayed_work_sync(&charger->host_work);
++	cancel_delayed_work_sync(&charger->host_work1);
++	cancel_delayed_work_sync(&charger->discnt_work);
++}
++
++static void bq25700_stop(struct bq25700_device *charger, bool destroy_wq)
++{
++	mutex_lock(&charger->sync_lock);
++	charger->shutting_down = true;
++	charger->automode = -1;
++	mutex_unlock(&charger->sync_lock);
++
++	if (charger->irq_wake_enabled) {
++		disable_irq_wake(charger->client->irq);
++		charger->irq_wake_enabled = false;
++	}
++	if (charger->irq_requested && !charger->irq_disabled) {
++		disable_irq(charger->client->irq);
++		charger->irq_disabled = true;
++	}
++
++	bq25700_unregister_notifiers(charger);
++	bq25700_cancel_works(charger);
++	if (destroy_wq && charger->usb_charger_wq) {
++		destroy_workqueue(charger->usb_charger_wq);
++		charger->usb_charger_wq = NULL;
++	}
++	bq25700_remove_sysfs(charger);
++	if (charger->notify_node) {
++		of_node_put(charger->notify_node);
++		charger->notify_node = NULL;
++	}
++	device_init_wakeup(charger->dev, false);
++}
++
+ static int bq25700_parse_dt(struct bq25700_device *charger)
+ {
+ 	int ret;
+@@ -1955,6 +2348,7 @@ static int bq25700_probe(struct i2c_client *client,
+ 	struct device *dev = &client->dev;
+ 	struct bq25700_device *charger;
+ 	struct device_node *charger_np;
++	bool use_bq25700;
+ 	int ret = 0;
+ 	u32 i = 0;
+ 	int irq_flag;
+@@ -1968,11 +2362,15 @@ static int bq25700_probe(struct i2c_client *client,
+ 
+ 	charger->client = client;
+ 	charger->dev = dev;
++	mutex_init(&charger->sync_lock);
+ 
+ 	charger_np = of_find_compatible_node(NULL, NULL, "ti,bq25700");
+ 	if (!charger_np)
+ 		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8885");
+-	if (charger_np) {
++	use_bq25700 = !!charger_np;
++	if (charger_np)
++		of_node_put(charger_np);
++	if (use_bq25700) {
+ 		charger->regmap = devm_regmap_init_i2c(client,
+ 						       &bq25700_regmap_config);
+ 		if (IS_ERR(charger->regmap)) {
+@@ -2038,14 +2436,23 @@ static int bq25700_probe(struct i2c_client *client,
+ 	 * Make sure battery online, otherwise, writing INPUT_CURRENT and
+ 	 * CHARGE_CURRENT would make system power off
+ 	 */
+-	if (of_parse_phandle(charger->dev->of_node, "ti,battery", 0)) {
+-		if (IS_ERR_OR_NULL(power_supply_get_by_phandle(
+-						charger->dev->of_node,
+-						"ti,battery"))) {
+-			dev_info(charger->dev, "No battery found\n");
+-			return -EPROBE_DEFER;
++	{
++		struct device_node *battery_np;
++		struct power_supply *battery_psy;
++
++		battery_np = of_parse_phandle(charger->dev->of_node,
++					      "ti,battery", 0);
++		if (battery_np) {
++			battery_psy = power_supply_get_by_phandle(
++					charger->dev->of_node, "ti,battery");
++			of_node_put(battery_np);
++			if (IS_ERR_OR_NULL(battery_psy)) {
++				dev_info(charger->dev, "No battery found\n");
++				return -EPROBE_DEFER;
++			}
++			power_supply_put(battery_psy);
++			dev_info(charger->dev, "Battery found\n");
+ 		}
+-		dev_info(charger->dev, "Battery found\n");
+ 	}
+ 
+ 	ret = bq25700_hw_init(charger);
+@@ -2057,12 +2464,18 @@ static int bq25700_probe(struct i2c_client *client,
+ 	bq25700_parse_dt(charger);
+ 	bq25700_init_sysfs(charger);
+ 
+-	bq25700_power_supply_init(charger);
+-	bq25700_init_usb(charger);
++	ret = bq25700_power_supply_init(charger);
++	if (ret)
++		goto err_stop;
++
++	ret = bq25700_init_usb(charger);
++	if (ret)
++		goto err_stop;
+ 
+ 	if (client->irq < 0) {
+ 		dev_err(dev, "No irq resource found.\n");
+-		return client->irq;
++		ret = client->irq;
++		goto err_stop;
+ 	}
+ 
+ 	if (bq25700_field_read(charger, AC_STAT))
+@@ -2077,20 +2490,51 @@ static int bq25700_probe(struct i2c_client *client,
+ 					irq_flag | IRQF_ONESHOT,
+ 					"bq25700_irq", charger);
+ 	if (ret)
+-		goto irq_fail;
+-	enable_irq_wake(client->irq);
++		goto err_stop;
++	charger->irq_requested = true;
++	ret = enable_irq_wake(client->irq);
++	if (!ret)
++		charger->irq_wake_enabled = true;
++	else
++		dev_warn(dev, "failed to enable IRQ wake: %d\n", ret);
+ 
++	mutex_lock(&bq25700_charger_lock);
+ 	bq25700_charger = charger;
++	mutex_unlock(&bq25700_charger_lock);
++	if (charger->automode == 1 &&
++	    !READ_ONCE(charger->startup_sync_done))
++		queue_delayed_work(charger->usb_charger_wq,
++					   &charger->startup_sync_work,
++					   msecs_to_jiffies(BQ25700_STARTUP_SYNC_DELAY_MS));
+ 
+-irq_fail:
++	return 0;
++
++err_stop:
++	bq25700_stop(charger, true);
+ 	return ret;
+ }
+ 
++static void bq25700_remove(struct i2c_client *client)
++{
++	struct bq25700_device *charger = i2c_get_clientdata(client);
++
++	mutex_lock(&bq25700_charger_lock);
++	if (bq25700_charger == charger)
++		bq25700_charger = NULL;
++	mutex_unlock(&bq25700_charger_lock);
++	bq25700_stop(charger, true);
++}
++
+ static void bq25700_shutdown(struct i2c_client *client)
+ {
+ 	int vol_idx;
+ 	struct bq25700_device *charger = i2c_get_clientdata(client);
+ 
++	mutex_lock(&bq25700_charger_lock);
++	if (bq25700_charger == charger)
++		bq25700_charger = NULL;
++	mutex_unlock(&bq25700_charger_lock);
++	bq25700_stop(charger, true);
+ 	vol_idx = bq25700_find_idx(DEFAULT_INPUTVOL, TBL_INPUTVOL);
+ 	bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
+ 	bq25700_field_write(charger, INPUT_CURRENT,
+@@ -2146,6 +2590,7 @@ static const struct of_device_id bq25700_of_match[] = {
+ 
+ static struct i2c_driver bq25700_driver = {
+ 	.probe		= bq25700_probe,
++	.remove		= bq25700_remove,
+ 	.shutdown	= bq25700_shutdown,
+ 	.id_table	= bq25700_i2c_ids,
+ 	.driver = {
+diff --git a/drivers/power/supply/rk817_battery.c b/drivers/power/supply/rk817_battery.c
+index dc5a25440..e304efb33 100644
+--- a/drivers/power/supply/rk817_battery.c
++++ b/drivers/power/supply/rk817_battery.c
+@@ -628,6 +628,7 @@ struct rk817_battery_device {
+ };
+ 
+ static void rk817_bat_resume_work(struct work_struct *work);
++static bool rk817_bat_is_system_supplied(struct rk817_battery_device *battery);
+ 
+ static u64 get_boot_sec(void)
+ {
+@@ -1277,10 +1278,14 @@ static int rk817_bat_get_fcc(struct rk817_battery_device *battery)
+ static int rk817_bat_get_rsoc(struct rk817_battery_device *battery)
+ {
+ 	int remain_cap;
++	int rsoc;
+ 
+ 	remain_cap = rk817_bat_get_capacity_uah(battery);
++	rsoc = remain_cap * 100 / DIV(battery->fcc);
++	if (rsoc > 100 * 1000)
++		rsoc = 100 * 1000;
+ 
+-	return remain_cap * 100 / DIV(battery->fcc);
++	return rsoc;
+ }
+ 
+ static int rk817_bat_get_off_count(struct rk817_battery_device *battery)
+@@ -1364,13 +1369,17 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
+ 	int status;
+ 
+ 	if (battery->chip_id == RK809_ID) {
+-		if ((battery->voltage_avg > battery->pdata->design_max_voltage) &&
+-		    (battery->current_avg > 0) &&
+-		    ((battery->current_avg < 500) ||
+-		     (battery->rsoc / 1000 == 100)))
++		bool charger_online;
++
++		charger_online = battery->plugin_trigger ||
++			rk817_bat_is_system_supplied(battery);
++		if (charger_online && (abs(battery->current_avg) <= 100) &&
++		    (battery->voltage_avg + 50 >=
++		     battery->pdata->design_max_voltage) &&
++		    (battery->rsoc >= 99 * 1000))
+ 			return CHARGE_FINISH;
+ 
+-		if (battery->plugin_trigger)
++		if (charger_online)
+ 			return CC_OR_CV_CHRG;
+ 		else
+ 			return CHRG_OFF;
+@@ -1378,7 +1387,7 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
+ 	status = rk817_bat_field_read(battery, CHG_STS);
+ 
+ 	if (status == CC_OR_CV_CHRG) {
+-		if (battery->rsoc == 100 * 1000) {
++		if (battery->rsoc >= 100 * 1000) {
+ 			DBG("charge to finish\n");
+ 			status = CHARGE_FINISH;
+ 		}
+@@ -1422,7 +1431,7 @@ static int rk817_bat_get_charge_status(struct rk817_battery_device *battery)
+  */
+ static bool rk817_bat_fake_finish_mode(struct rk817_battery_device *battery)
+ {
+-	if ((battery->rsoc == 100) &&
++	if ((battery->rsoc >= 100 * 1000) &&
+ 	    (rk817_bat_get_charge_status(battery) == CC_OR_CV_CHRG) &&
+ 	    (abs(battery->current_avg) <= 100))
+ 		return true;
+@@ -1595,6 +1604,12 @@ static void rk817_bat_init_dsoc_algorithm(struct rk817_battery_device *battery)
+ 	    __func__, battery->sm_remain_cap, battery->smooth_soc);
+ }
+ 
++static bool rk817_bat_is_system_supplied(struct rk817_battery_device *battery)
++{
++	/* Do not use the power-supply core's desktop fallback during probe. */
++	return battery->bat && power_supply_is_system_supplied() > 0;
++}
++
+ static void rk817_bat_first_pwron(struct rk817_battery_device *battery)
+ {
+ 	battery->rsoc =
+@@ -1643,12 +1658,13 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
+ 	} else if (battery->is_ocv_calib) {
+ 		/* not initialized and poweroff_cnt above 30 min */
+ 		ocv_vol = rk817_bat_get_ocv_voltage(battery);
+-		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol);
++		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol) * 1000;
+ 		ocv_cap = rk817_bat_vol_to_cap(battery, ocv_vol);
+ 		pre_cap = ocv_cap;
+ 		battery->ocv_pre_dsoc = pre_soc;
+ 		battery->ocv_new_dsoc = ocv_soc;
+-		if (abs(ocv_soc - pre_soc) >= battery->pdata->max_soc_offset) {
++		if (abs(ocv_soc - pre_soc) >=
++		    battery->pdata->max_soc_offset * 1000) {
+ 			battery->ocv_pre_dsoc = pre_soc;
+ 			battery->ocv_new_dsoc = ocv_soc;
+ 			battery->is_max_soc_offset = true;
+@@ -1659,11 +1675,11 @@ static void rk817_bat_not_first_pwron(struct rk817_battery_device *battery)
+ 		BAT_INFO("OCV calib: cap=%d, rsoc=%d\n", ocv_cap, ocv_soc);
+ 	} else if (battery->pwroff_min > 0) {
+ 		ocv_vol = rk817_bat_get_ocv_voltage(battery);
+-		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol);
++		ocv_soc = rk817_bat_vol_to_soc(battery, ocv_vol) * 1000;
+ 		ocv_cap = rk817_bat_vol_to_cap(battery, ocv_vol);
+ 		battery->force_pre_dsoc = pre_soc;
+ 		battery->force_new_dsoc = ocv_soc;
+-		if (abs(ocv_soc - pre_soc) >= 80) {
++		if (abs(ocv_soc - pre_soc) >= 80 * 1000) {
+ 			battery->is_force_calib = true;
+ 			BAT_INFO("dsoc force calib: %d -> %d\n",
+ 				 pre_soc, ocv_soc);
+@@ -2009,6 +2025,9 @@ static int rk817_bat_get_charge_state(struct rk817_battery_device *battery)
+ 	int ret;
+ 	struct power_supply *psy;
+ 
++	battery->usb_in = 0;
++	battery->ac_in = 0;
++
+ 	if (!battery->usb_psy || !battery->ac_psy)
+ 		rk817_bat_get_chrg_psy(battery);
+ 
+@@ -2027,6 +2046,8 @@ static int rk817_bat_get_charge_state(struct rk817_battery_device *battery)
+ 		if (!ret)
+ 			battery->ac_in = val.intval;
+ 	}
++	if (rk817_bat_is_system_supplied(battery))
++		battery->usb_in = 1;
+ 
+ 	DBG("%s: ac_online=%d, usb_online=%d\n",
+ 	    __func__, battery->ac_in, battery->usb_in);
+@@ -2109,14 +2130,11 @@ static int rk817_battery_get_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		if (battery->pdata->bat_mode == MODE_VIRTUAL)
+ 			val->intval = VIRTUAL_STATUS;
+-		else if (battery->dsoc == 100 * 1000)
++		else if (battery->dsoc >= 100 * 1000)
+ 			val->intval = POWER_SUPPLY_STATUS_FULL;
+ 		else {
+-			if ((battery->chip_id != RK809_ID) &&
+-			    rk817_bat_get_charge_state(battery))
+-				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+-			else if (battery->chip_id == RK809_ID &&
+-				 battery->plugin_trigger)
++			if (rk817_bat_get_charge_state(battery) ||
++			    (battery->chip_id == RK809_ID && battery->plugin_trigger))
+ 				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+ 			else
+ 				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+@@ -2339,6 +2357,28 @@ static void rk817_bat_update_info(struct rk817_battery_device *battery)
+ 		battery->finish_base = get_boot_sec();
+ }
+ 
++static void rk817_bat_sync_full_dsoc(struct rk817_battery_device *battery)
++{
++	int soc_gap;
++
++	if (battery->chrg_status != CHARGE_FINISH ||
++	    battery->rsoc < 99 * 1000 || abs(battery->current_avg) > 100 ||
++	    battery->voltage_avg + 50 < battery->pdata->design_max_voltage)
++		return;
++
++	soc_gap = battery->rsoc - battery->dsoc;
++	if (soc_gap < 20 * 1000)
++		return;
++
++	BAT_INFO("full-charge DSOC recovery: dsoc=%d rsoc=%d\n",
++		 battery->dsoc, battery->rsoc);
++	battery->dsoc = min(battery->rsoc, 100 * 1000);
++	battery->smooth_soc = battery->dsoc;
++	battery->sm_remain_cap = battery->remain_cap;
++	battery->work_mode = MODE_FINISH;
++	battery->finish_base = get_boot_sec();
++}
++
+ static void rk817_bat_save_data(struct rk817_battery_device *battery)
+ {
+ 	rk817_bat_save_dsoc(battery, battery->dsoc);
+@@ -2761,7 +2801,7 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
+ 	int plus_soc, finish_current, rest = 0;
+ 
+ 	/* rsoc */
+-	if ((battery->remain_cap != battery->fcc) &&
++	if ((battery->remain_cap != battery->fcc * 1000) &&
+ 	    (get_charge_status(battery) == CHARGE_FINISH)) {
+ 		battery->age_adjust_cap +=
+ 			(battery->fcc * 1000 - battery->remain_cap);
+@@ -2774,7 +2814,8 @@ static void rk817_bat_finish_algorithm(struct rk817_battery_device *battery)
+ 		if (!battery->finish_base)
+ 			battery->finish_base = get_boot_sec();
+ 
+-		finish_current = (battery->rsoc - battery->dsoc) > FINISH_MAX_SOC_DELAY ?
++		finish_current = (battery->rsoc - battery->dsoc) >
++				 FINISH_MAX_SOC_DELAY * 1000 ?
+ 					FINISH_CHRG_CUR2 : FINISH_CHRG_CUR1;
+ 		finish_sec = base2sec(battery->finish_base);
+ 
+@@ -2892,6 +2933,7 @@ static void rk817_battery_work(struct work_struct *work)
+ 
+ 	rk817_bat_update_info(battery);
+ 	rk817_bat_lowpwr_check(battery);
++	rk817_bat_sync_full_dsoc(battery);
+ 	rk817_bat_display_smooth(battery);
+ 	rk817_bat_power_supply_changed(battery);
+ 	rk817_bat_save_data(battery);
+diff --git a/drivers/usb/typec/tcpm/tcpci_husb311.c b/drivers/usb/typec/tcpm/tcpci_husb311.c
+index faed6b65f..519cfe9dc 100644
+--- a/drivers/usb/typec/tcpm/tcpci_husb311.c
++++ b/drivers/usb/typec/tcpm/tcpci_husb311.c
+@@ -31,6 +31,7 @@ struct husb311_chip {
+ 	struct tcpci *tcpci;
+ 	struct device *dev;
+ 	struct regulator *vbus;
++	struct gpio_desc *switch_ctl;
+ 	struct mutex lock; /* lock for sharing chip states */
+ 	struct delayed_work pm_work;
+ 	bool vbus_on;
+@@ -44,6 +45,11 @@ static int husb311_read8(struct husb311_chip *chip, unsigned int reg, u8 *val)
+ 	return regmap_raw_read(chip->data.regmap, reg, val, sizeof(u8));
+ }
+ 
++static int husb311_read16(struct husb311_chip *chip, unsigned int reg, u16 *val)
++{
++	return regmap_raw_read(chip->data.regmap, reg, val, sizeof(u16));
++}
++
+ static int husb311_write8(struct husb311_chip *chip, unsigned int reg, u8 val)
+ {
+ 	return regmap_raw_write(chip->data.regmap, reg, &val, sizeof(u8));
+@@ -94,11 +100,12 @@ static void husb311_pm_work(struct work_struct *work)
+ 	mutex_lock(&chip->lock);
+ 
+ 	if (!chip->vbus_on && !chip->charge_on) {
+-		if (chip->suspended)
+-			goto exit;
+-
+-		husb311_disable_osc24m(chip);
+-		chip->suspended = 1;
++		/*
++		 * Keep the TCPC oscillator running while the system is active.
++		 * Turning it off here prevents the HUSB311 from reliably seeing a
++		 * later CC attach after the port has been unplugged.
++		 */
++		goto exit;
+ 	} else {
+ 		if (chip->suspended)
+ 			chip->suspended = 0;
+@@ -119,6 +126,11 @@ static int husb311_init(struct tcpci *tcpci, struct tcpci_data *tdata)
+ 	int ret;
+ 	struct husb311_chip *chip = tdata_to_husb311(tdata);
+ 
++	/* Keep the TCPC quiet until tcpci_init enables the final alert mask. */
++	ret = husb311_write16(chip, TCPC_ALERT_MASK, 0);
++	if (ret < 0)
++		return ret;
++
+ 	/* tTCPCfilter : (26.7 * val) us */
+ 	ret = husb311_write8(chip, HUSB311_TCPC_FILTER, 0x0F);
+ 	/* tDRP : (51.2 + 6.4 * val) ms */
+@@ -175,10 +187,10 @@ static irqreturn_t husb311_irq(int irq, void *dev_id)
+ 	struct husb311_chip *chip = dev_id;
+ 	enum typec_cc_status cc1, cc2;
+ 	u8 reg, role_ctrl;
+-	u8 status;
++	u16 status;
+ 
+-	husb311_read8(chip, TCPC_ALERT, &status);
+-	dev_dbg(chip->dev, "status 0x%02x", status);
++	husb311_read16(chip, TCPC_ALERT, &status);
++	dev_dbg(chip->dev, "status 0x%04x", status);
+ 
+ 	/*
+ 	 * If husb311 detects one of CC is Rp, let do clear the another CC
+@@ -278,6 +290,16 @@ static int husb311_probe(struct i2c_client *client,
+ 			return ret;
+ 	}
+ 
++	/* Enable the board-level USB-C path before resetting the TCPC. */
++	chip->switch_ctl = devm_gpiod_get_optional(chip->dev, "switch-ctl",
++							GPIOD_OUT_HIGH);
++	if (IS_ERR(chip->switch_ctl)) {
++		ret = PTR_ERR(chip->switch_ctl);
++		dev_err(chip->dev, "failed to request switch control GPIO: %d\n",
++			ret);
++		return ret;
++	}
++
+ 	ret = husb311_sw_reset(chip);
+ 	if (ret < 0) {
+ 		dev_err(chip->dev, "fail to soft reset, ret = %d\n", ret);
+@@ -314,6 +336,8 @@ static void husb311_remove(struct i2c_client *client)
+ 	disable_irq(client->irq);
+ 	cancel_delayed_work_sync(&chip->pm_work);
+ 	tcpci_unregister_port(chip->tcpci);
++	if (chip->switch_ctl)
++		gpiod_set_value_cansleep(chip->switch_ctl, 0);
+ }
+ 
+ static void husb311_shutdown(struct i2c_client *client)
+@@ -324,6 +348,8 @@ static void husb311_shutdown(struct i2c_client *client)
+ 
+ 	disable_irq(client->irq);
+ 	cancel_delayed_work_sync(&chip->pm_work);
++	if (chip->switch_ctl)
++		gpiod_set_value_cansleep(chip->switch_ctl, 0);
+ }
+ 
+ static int husb311_pm_suspend(struct device *dev)

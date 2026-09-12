@@ -36,14 +36,14 @@ on:
         type: choice
         description: 'User interface (not all works)'
         options:
+        - xfce
+        - cinnamon
         - minimal
         - server
-        - xfce
         - gnome
-        - cinnamon
         - i3-wm
         - kde-plasma
-        default: 'minimal'
+        default: 'xfce'
 
       armbian_version:
         description: 'Version'
@@ -262,6 +262,8 @@ jobs:
   build:
     name: "Build Armbian"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
 
       - uses: actions/checkout@v4
@@ -281,3 +283,12 @@ jobs:
           armbian_pgp_key:            "${{secrets.GPG_KEY1}}"
           armbian_pgp_password:       "${{secrets.GPG_PASSPHRASE1}}"
           armbian_branch:             "main"
+
+      - name: "Upload Image Artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: armbian-z96a-images
+          path: build/output/images/*
+          if-no-files-found: ignore
+          retention-days: 7
