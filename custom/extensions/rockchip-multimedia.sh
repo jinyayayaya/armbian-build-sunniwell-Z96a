@@ -46,6 +46,7 @@ declare -g EXT_LIBVA_GIT="https://github.com/intel/libva.git"
 declare -g EXT_LIBVA_REF="2.17.0"
 declare -g EXT_VADRV_GIT="https://github.com/tarcila/libva-rkmpp.git"
 declare -g EXT_VADRV_REF="e69ea1368893cc15c8d59618397ab8d78df648b9"
+declare -g EXT_MOONLIGHT_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/z96a-moonlight-rkmpp.tar.gz"
 
 # Fetch `repo_url` at pinned `sha` into `dest_dir` (idempotent).
 function _rockchip_multimedia_fetch_pinned() {
@@ -70,9 +71,16 @@ function post_family_config__rockchip_multimedia_gles_packages() {
 	display_alert "rockchip-multimedia" "adding Mesa GLES userspace packages" "info"
 	# Mesa Panfrost provides EGL/GLES3.1; libgl1-mesa-dri ships the gallium drivers.
 	# libva2/libva-drm2 runtime + vainfo for the VA-API->MPP decode path.
-	add_packages_to_image libegl1 libgles2 libgl1-mesa-dri libva2 libva-drm2 vainfo
+	# mpv video player with VA-API hardware decode support.
+	add_packages_to_image libegl1 libgles2 libgl1-mesa-dri libva2 libva-drm2 vainfo mpv
 	if [[ "${BUILD_MINIMAL:-}" != "yes" ]]; then
 		add_packages_to_image glmark2-es2 # on-device GLES sanity check
+	fi
+	if [[ "${BUILD_DESKTOP:-}" == "yes" ]]; then
+		# Moonlight Qt6 runtime + SDL2 + Opus + VA-API helpers
+		add_packages_to_image libsdl2-2.0-0 libsdl2-ttf-2.0-0 libopus0 libva-x11-2 libva-wayland2 \
+			qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
+			qml6-module-qtquick-templates qml6-module-qtquick-window qt6-qpa-plugins libqt6svg6
 	fi
 	return 0
 }
@@ -255,6 +263,16 @@ function pre_customize_image__rockchip_multimedia_install() {
 		display_alert "rockchip-multimedia" "VA-API driver already staged, reusing" "debug"
 	fi
 
+	# --------------------------------------------- Moonlight + FFmpeg Rockchip --
+	if [[ ! -e "${stage}/usr/local/bin/moonlight" ]]; then
+		display_alert "rockchip-multimedia" "fetching and staging Moonlight-Qt + ffmpeg-rockchip" "info"
+		local ml_tar="${work_dir}/z96a-moonlight-rkmpp.tar.gz"
+		run_host_command_logged curl -fL --retry 3 -o "${ml_tar}" "${EXT_MOONLIGHT_URL}"
+		run_host_command_logged tar -zxvf "${ml_tar}" -C "${stage}/"
+	else
+		display_alert "rockchip-multimedia" "Moonlight already staged, reusing" "debug"
+	fi
+
 	# --------------------------------------------- udev rules + copy to rootfs --
 	cat > "${SDCARD}/etc/udev/rules.d/60-rockchip-multimedia.rules" <<- 'EOF'
 		# Rockchip multimedia accelerators: allow the 'video' group.
@@ -276,6 +294,15 @@ function pre_customize_image__rockchip_multimedia_install() {
 		echo 'LIBVA_DRIVER_NAME=rockchip' >> "${SDCARD}/etc/environment"
 		echo 'MOZ_DISABLE_RDD_SANDBOX=1' >> "${SDCARD}/etc/environment"
 	fi
+
+	# mpv hardware decoding configuration
+	mkdir -p "${SDCARD}/etc/mpv"
+	cat > "${SDCARD}/etc/mpv/mpv.conf" <<- 'EOF'
+		# Hardware video decode via VA-API -> rockchip(MPP)
+		hwdec=vaapi
+		vo=gpu
+		gpu-context=wayland,x11egl
+	EOF
 
 	# Firefox-esr prefs (only when firefox-esr is present in this image).
 	local ff_pref_dir="${SDCARD}/usr/lib/firefox-esr/defaults/pref"
@@ -319,13 +346,18 @@ function pre_umount_final_image__rockchip_multimedia_verify() {
 		"usr/include/rknn/rknn_api.h" \
 		"${lib_dir}/dri/rockchip_drv_video.so" \
 		"etc/udev/rules.d/60-rockchip-multimedia.rules" \
-		"etc/profile.d/rockchip-vaapi.sh"; do
+		"etc/profile.d/rockchip-vaapi.sh" \
+		"etc/mpv/mpv.conf" \
+		"usr/local/bin/moonlight" \
+		"usr/local/bin/moonlight-qt-wrapper" \
+		"opt/ffmpeg-rockchip/lib/libavcodec.so.60" \
+		"etc/ld.so.conf.d/00-ffmpeg-rockchip.conf"; do
 		if [[ ! -e "${SDCARD}/${f}" ]]; then
 			exit_with_error "rockchip-multimedia: expected file missing from rootfs: /${f}"
 		fi
 	done
 
-	display_alert "rockchip-multimedia" "verified: MPP + librga + RKNN runtime + GLES (Panfrost) + VA-API backend installed" "info"
+	display_alert "rockchip-multimedia" "verified: MPP + librga + RKNN + GLES + VA-API + Moonlight (RKMPP) + mpv installed" "info"
 	display_alert "rockchip-multimedia" "on-device checks: vainfo, mpi_dec_test, glmark2-es2; firefox about:support should show HW decode" "info"
 	return 0
 }
