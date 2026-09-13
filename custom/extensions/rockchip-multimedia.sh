@@ -349,7 +349,27 @@ function pre_customize_image__rockchip_multimedia_install() {
 	fi
 
 	display_alert "rockchip-multimedia" "copying staged userspace into rootfs" "info"
-	run_host_command_logged cp -av "${stage}/." "${SDCARD}/"
+	# Debian bookworm images use merged-/usr, where /lib is a symlink to
+	# /usr/lib. Copying the staged top-level directory in one operation makes
+	# cp try to replace that symlink with the Moonlight archive's lib directory.
+	# Merge lib's contents into the symlink target instead, while retaining the
+	# old destination for non-merged-/usr rootfs layouts.
+	if [[ -d "${stage}/lib" ]]; then
+		local lib_target="${SDCARD}/lib"
+		if [[ -L "${SDCARD}/lib" ]]; then
+			lib_target="${SDCARD}/usr/lib"
+		fi
+		run_host_command_logged mkdir -p "${lib_target}"
+		run_host_command_logged cp -av "${stage}/lib/." "${lib_target}/"
+	fi
+
+	local staged_path staged_name
+	for staged_path in "${stage}"/*; do
+		[[ -e "${staged_path}" || -L "${staged_path}" ]] || continue
+		staged_name=${staged_path##*/}
+		[[ "${staged_name}" = lib ]] && continue
+		run_host_command_logged cp -av "${staged_path}" "${SDCARD}/"
+	done
 	chroot_sdcard ldconfig
 
 	return 0
