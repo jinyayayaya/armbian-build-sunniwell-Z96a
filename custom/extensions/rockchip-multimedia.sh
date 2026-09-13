@@ -81,7 +81,8 @@ function post_family_config__rockchip_multimedia_gles_packages() {
 		# Moonlight Qt6 runtime + SDL2 + Opus + VA-API helpers
 		add_packages_to_image libsdl2-2.0-0 libsdl2-ttf-2.0-0 libopus0 libva-x11-2 libva-wayland2 \
 			qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
-			qml6-module-qtquick-templates qml6-module-qtquick-window qt6-qpa-plugins libqt6svg6
+			qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript \
+			qt6-qpa-plugins libqt6svg6
 		# Samba/CIFS network share browsing and streaming
 		add_packages_to_image gvfs gvfs-backends gvfs-fuse cifs-utils smbclient libsmbclient
 		# RustDesk remote desktop dependencies
