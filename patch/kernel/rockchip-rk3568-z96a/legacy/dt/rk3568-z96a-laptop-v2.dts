@@ -1331,7 +1331,7 @@
 			ti,charge-current = <0xf4240>;
 			pinctrl-0 = <0x342>;
 			pinctrl-names = "default";
-			interrupts = <0x12 0x08>;
+			interrupts = <0x12 0x03>;
 			interrupt-parent = <0x41>;
 			compatible = "southchip,sc8886";
 			reg = <0x6b>;

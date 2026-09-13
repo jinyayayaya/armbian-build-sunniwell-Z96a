@@ -47,6 +47,7 @@ declare -g EXT_LIBVA_REF="2.17.0"
 declare -g EXT_VADRV_GIT="https://github.com/tarcila/libva-rkmpp.git"
 declare -g EXT_VADRV_REF="e69ea1368893cc15c8d59618397ab8d78df648b9"
 declare -g EXT_MOONLIGHT_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/z96a-moonlight-rkmpp.tar.gz"
+declare -g EXT_RUSTDESK_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/rustdesk-1.4.9-rk3568-arm64.deb"
 
 # Fetch `repo_url` at pinned `sha` into `dest_dir` (idempotent).
 function _rockchip_multimedia_fetch_pinned() {
@@ -83,6 +84,8 @@ function post_family_config__rockchip_multimedia_gles_packages() {
 			qml6-module-qtquick-templates qml6-module-qtquick-window qt6-qpa-plugins libqt6svg6
 		# Samba/CIFS network share browsing and streaming
 		add_packages_to_image gvfs gvfs-backends gvfs-fuse cifs-utils smbclient libsmbclient
+		# RustDesk remote desktop dependencies
+		add_packages_to_image libxdo3 libayatana-appindicator3-1 gstreamer1.0-pipewire
 	fi
 	return 0
 }
@@ -275,6 +278,15 @@ function pre_customize_image__rockchip_multimedia_install() {
 		display_alert "rockchip-multimedia" "Moonlight already staged, reusing" "debug"
 	fi
 
+	# --------------------------------------------- RustDesk (RKMPP accelerated) --
+	if [[ "${BUILD_DESKTOP:-}" == "yes" && ! -e "${SDCARD}/usr/bin/rustdesk" ]]; then
+		display_alert "rockchip-multimedia" "fetching and installing RustDesk RKMPP" "info"
+		local rd_deb="${work_dir}/rustdesk-1.4.9-rk3568-arm64.deb"
+		run_host_command_logged curl -fL --retry 3 -o "${rd_deb}" "${EXT_RUSTDESK_URL}"
+		install_deb_chroot "${rd_deb}"
+		chroot_sdcard systemctl enable rustdesk || true
+	fi
+
 	# --------------------------------------------- udev rules + copy to rootfs --
 	cat > "${SDCARD}/etc/udev/rules.d/60-rockchip-multimedia.rules" <<- 'EOF'
 		# Rockchip multimedia accelerators: allow the 'video' group.
@@ -373,7 +385,15 @@ function pre_umount_final_image__rockchip_multimedia_verify() {
 		fi
 	done
 
-	display_alert "rockchip-multimedia" "verified: MPP + librga + RKNN + GLES + VA-API + Moonlight (RKMPP) + mpv installed" "info"
+	if [[ "${BUILD_DESKTOP:-}" == "yes" ]]; then
+		for f in "usr/bin/rustdesk" "usr/share/rustdesk/lib/librustdesk.so"; do
+			if [[ ! -e "${SDCARD}/${f}" ]]; then
+				exit_with_error "rockchip-multimedia: expected file missing from rootfs: /${f}"
+			fi
+		done
+	fi
+
+	display_alert "rockchip-multimedia" "verified: MPP + librga + RKNN + GLES + VA-API + Moonlight (RKMPP) + mpv + RustDesk installed" "info"
 	display_alert "rockchip-multimedia" "on-device checks: vainfo, mpi_dec_test, glmark2-es2; firefox about:support should show HW decode" "info"
 	return 0
 }

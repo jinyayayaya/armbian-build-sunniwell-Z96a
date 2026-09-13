@@ -1,0 +1,66 @@
+diff --git a/drivers/net/usb/r8152.c b/drivers/net/usb/r8152.c
+index 958a02b19..549dd3e1f 100644
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@ -39,6 +39,10 @@
+ #define DRIVER_DESC "Realtek RTL8152/RTL8153 Based USB Ethernet Adapters"
+ #define MODULENAME "r8152"
+ 
++static bool eee_enable = false;
++module_param(eee_enable, bool, 0644);
++MODULE_PARM_DESC(eee_enable, "Enable Energy Efficient Ethernet (EEE) (default: false)");
++
+ #define R8152_PHY_ID		32
+ 
+ #define PLA_IDR			0xc000
+@@ -9342,7 +9346,7 @@ static int rtl_ops_init(struct r8152 *tp)
+ 		ops->hw_phy_cfg		= r8152b_hw_phy_cfg;
+ 		ops->autosuspend_en	= rtl_runtime_suspend_enable;
+ 		tp->rx_buf_sz		= 16 * 1024;
+-		tp->eee_en		= true;
++		tp->eee_en		= eee_enable;
+ 		tp->eee_adv		= MDIO_EEE_100TX;
+ 		break;
+ 
+@@ -9366,7 +9370,7 @@ static int rtl_ops_init(struct r8152 *tp)
+ 			tp->rx_buf_sz	= 16 * 1024;
+ 		else
+ 			tp->rx_buf_sz	= 32 * 1024;
+-		tp->eee_en		= true;
++		tp->eee_en		= eee_enable;
+ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+ 		break;
+ 
+@@ -9385,12 +9389,12 @@ static int rtl_ops_init(struct r8152 *tp)
+ 		ops->autosuspend_en	= rtl8153b_runtime_enable;
+ 		ops->change_mtu		= rtl8153_change_mtu;
+ 		tp->rx_buf_sz		= 32 * 1024;
+-		tp->eee_en		= true;
++		tp->eee_en		= eee_enable;
+ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+ 		break;
+ 
+ 	case RTL_VER_11:
+-		tp->eee_en		= true;
++		tp->eee_en		= eee_enable;
+ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+ 		fallthrough;
+ 	case RTL_VER_10:
+@@ -9415,7 +9419,7 @@ static int rtl_ops_init(struct r8152 *tp)
+ 		tp->support_2500full	= 1;
+ 		fallthrough;
+ 	case RTL_VER_15:
+-		tp->eee_en		= true;
++		tp->eee_en		= eee_enable;
+ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+ 		ops->init		= r8156b_init;
+ 		ops->enable		= rtl8156b_enable;
+@@ -9446,7 +9450,7 @@ static int rtl_ops_init(struct r8152 *tp)
+ 		ops->autosuspend_en	= rtl8153c_runtime_enable;
+ 		ops->change_mtu		= rtl8153c_change_mtu;
+ 		tp->rx_buf_sz		= 32 * 1024;
+-		tp->eee_en		= true;
++		tp->eee_en		= eee_enable;
+ 		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+ 		break;
+ 
