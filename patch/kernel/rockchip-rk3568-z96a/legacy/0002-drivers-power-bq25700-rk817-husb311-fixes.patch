@@ -989,10 +989,11 @@ index d67607cc9..6f50f3af1 100644
  static int bq25700_parse_dt(struct bq25700_device *charger)
  {
  	int ret;
-@@ -1955,9 +2344,9 @@ static int bq25700_probe(struct i2c_client *client,
+@@ -1954,10 +2343,9 @@ static int bq25700_probe(struct i2c_client *client,
+ 	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
  	struct device *dev = &client->dev;
  	struct bq25700_device *charger;
- 	struct device_node *charger_np;
+-	struct device_node *charger_np;
 +	bool use_bq25700;
  	int ret = 0;
  	u32 i = 0;
@@ -1000,21 +1001,19 @@ index d67607cc9..6f50f3af1 100644
  
  	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_WORD_DATA))
  		return -EIO;
-@@ -1968,11 +2357,17 @@ static int bq25700_probe(struct i2c_client *client,
+@@ -1968,11 +2356,12 @@ static int bq25700_probe(struct i2c_client *client,
  
  	charger->client = client;
  	charger->dev = dev;
 +	mutex_init(&charger->sync_lock);
  
- 	charger_np = of_find_compatible_node(NULL, NULL, "ti,bq25700");
- 	if (!charger_np)
- 		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8886");
+-	charger_np = of_find_compatible_node(NULL, NULL, "ti,bq25700");
+-	if (!charger_np)
+-		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8886");
 -	if (charger_np) {
-+	if (!charger_np)
-+		charger_np = of_find_compatible_node(NULL, NULL, "southchip,sc8885");
-+	use_bq25700 = !!charger_np;
-+	if (charger_np)
-+		of_node_put(charger_np);
++	use_bq25700 = !of_device_is_compatible(dev->of_node, "southchip,sc8886") &&
++		(of_device_is_compatible(dev->of_node, "ti,bq25700") ||
++		 of_device_is_compatible(dev->of_node, "southchip,sc8885"));
 +	if (use_bq25700) {
  		charger->regmap = devm_regmap_init_i2c(client,
  						       &bq25700_regmap_config);
