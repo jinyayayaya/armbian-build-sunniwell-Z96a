@@ -280,12 +280,21 @@ function pre_customize_image__rockchip_multimedia_install() {
 	fi
 
 	# --------------------------------------------- RustDesk (RKMPP accelerated) --
-	if [[ "${BUILD_DESKTOP:-}" == "yes" && ! -e "${SDCARD}/usr/bin/rustdesk" ]]; then
+	if [[ "${BUILD_DESKTOP:-}" == "yes" && ! -e "${SDCARD}/usr/share/rustdesk/rustdesk" ]]; then
 		display_alert "rockchip-multimedia" "fetching and installing RustDesk RKMPP" "info"
 		local rd_deb="${work_dir}/rustdesk-1.4.9-rk3568-arm64.deb"
 		run_host_command_logged curl -fL --retry 3 -o "${rd_deb}" "${EXT_RUSTDESK_URL}"
 		install_deb_chroot "${rd_deb}"
-		chroot_sdcard systemctl enable rustdesk || true
+		# In chroot environments, /proc/1/exe is not systemd, so rustdesk.postinst
+		# skips copying the service file and creating /usr/bin/rustdesk symlink.
+		if [[ -f "${SDCARD}/usr/share/rustdesk/files/systemd/rustdesk.service" ]]; then
+			mkdir -p "${SDCARD}/usr/lib/systemd/system"
+			cp -f "${SDCARD}/usr/share/rustdesk/files/systemd/rustdesk.service" "${SDCARD}/usr/lib/systemd/system/rustdesk.service"
+			chroot_sdcard systemctl enable rustdesk || true
+		fi
+		if [[ ! -e "${SDCARD}/usr/bin/rustdesk" && ! -L "${SDCARD}/usr/bin/rustdesk" ]]; then
+			ln -sf /usr/share/rustdesk/rustdesk "${SDCARD}/usr/bin/rustdesk"
+		fi
 	fi
 
 	# --------------------------------------------- udev rules + copy to rootfs --
@@ -401,17 +410,21 @@ function pre_umount_final_image__rockchip_multimedia_verify() {
 		"usr/local/bin/moonlight-qt-wrapper" \
 		"opt/ffmpeg-rockchip/lib/libavcodec.so.60" \
 		"etc/ld.so.conf.d/00-ffmpeg-rockchip.conf"; do
-		if [[ ! -e "${SDCARD}/${f}" ]]; then
+		if [[ ! -e "${SDCARD}/${f}" && ! -L "${SDCARD}/${f}" ]]; then
 			exit_with_error "rockchip-multimedia: expected file missing from rootfs: /${f}"
 		fi
 	done
 
 	if [[ "${BUILD_DESKTOP:-}" == "yes" ]]; then
-		for f in "usr/bin/rustdesk" "usr/share/rustdesk/lib/librustdesk.so"; do
-			if [[ ! -e "${SDCARD}/${f}" ]]; then
+		for f in "usr/share/rustdesk/rustdesk" "usr/share/rustdesk/lib/librustdesk.so"; do
+			if [[ ! -e "${SDCARD}/${f}" && ! -L "${SDCARD}/${f}" ]]; then
 				exit_with_error "rockchip-multimedia: expected file missing from rootfs: /${f}"
 			fi
 		done
+		# usr/bin/rustdesk is a symlink to /usr/share/rustdesk/rustdesk
+		if [[ ! -e "${SDCARD}/usr/bin/rustdesk" && ! -L "${SDCARD}/usr/bin/rustdesk" ]]; then
+			exit_with_error "rockchip-multimedia: expected file missing from rootfs: /usr/bin/rustdesk"
+		fi
 	fi
 
 	display_alert "rockchip-multimedia" "verified: MPP + librga + RKNN + GLES + VA-API + Moonlight (RKMPP) + mpv + RustDesk installed" "info"
