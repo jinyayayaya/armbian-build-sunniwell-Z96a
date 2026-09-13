@@ -81,6 +81,8 @@ function post_family_config__rockchip_multimedia_gles_packages() {
 		add_packages_to_image libsdl2-2.0-0 libsdl2-ttf-2.0-0 libopus0 libva-x11-2 libva-wayland2 \
 			qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
 			qml6-module-qtquick-templates qml6-module-qtquick-window qt6-qpa-plugins libqt6svg6
+		# Samba/CIFS network share browsing and streaming
+		add_packages_to_image gvfs gvfs-backends gvfs-fuse cifs-utils smbclient libsmbclient
 	fi
 	return 0
 }
@@ -295,13 +297,27 @@ function pre_customize_image__rockchip_multimedia_install() {
 		echo 'MOZ_DISABLE_RDD_SANDBOX=1' >> "${SDCARD}/etc/environment"
 	fi
 
-	# mpv hardware decoding configuration
+	# mpv hardware decoding & network streaming configuration
 	mkdir -p "${SDCARD}/etc/mpv"
 	cat > "${SDCARD}/etc/mpv/mpv.conf" <<- 'EOF'
-		# Hardware video decode via VA-API -> rockchip(MPP)
-		hwdec=vaapi
+		# Sunniwell Z96A (RK3568) MPV Hardware Acceleration Configuration
 		vo=gpu
-		gpu-context=wayland,x11egl
+		gpu-context=x11egl
+		hwdec=auto
+		hwdec-codecs=all
+
+		# Performance & Display
+		video-sync=display-resample
+		interpolation=no
+		dither-depth=auto
+
+		# Audio Output
+		ao=pulse,alsa
+
+		# Network & Cache (Smooth playback over Samba / LAN / Wi-Fi)
+		demuxer-max-bytes=64MiB
+		demuxer-max-back-bytes=32MiB
+		force-seekable=yes
 	EOF
 
 	# Firefox-esr prefs (only when firefox-esr is present in this image).
