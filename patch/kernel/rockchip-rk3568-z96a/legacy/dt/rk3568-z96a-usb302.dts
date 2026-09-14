@@ -3577,7 +3577,7 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <0xc1 0xc2 0xc3 0xc4>;
 		status = "okay";
-		rockchip,clk-trcm = <0x01>;
+		rockchip,trcm-sync-tx-only;
 		phandle = <0xd3>;
 	};
 
@@ -3591,7 +3591,7 @@
 		dma-names = "tx\0rx";
 		rockchip,cru = <0x23>;
 		rockchip,grf = <0x3c>;
-		rockchip,clk-trcm = <0x01>;
+		rockchip,trcm-sync-tx-only;
 		#sound-dai-cells = <0x00>;
 		pinctrl-names = "default";
 		pinctrl-0 = <0xc5 0xc6 0xc7 0xc8>;

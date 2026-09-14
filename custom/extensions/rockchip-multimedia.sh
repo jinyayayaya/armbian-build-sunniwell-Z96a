@@ -602,6 +602,24 @@ function pre_umount_final_image__rockchip_multimedia_verify() {
 	fi
 
 	if [[ "${BUILD_DESKTOP:-}" == "yes" ]]; then
+		for f in \
+			"usr/bin/chromium" \
+			"usr/lib/chromium/chromium-wrapper" \
+			"etc/chromium.d/panfrost" \
+			"usr/lib/aarch64-linux-gnu/libv4l/plugins/libv4l-rkmpp.so" \
+			"lib/systemd/system/rockchip-chromium-x11-utils.service"; do
+			if [[ ! -e "${SDCARD}/${f}" && ! -L "${SDCARD}/${f}" ]]; then
+				exit_with_error "rockchip-multimedia: expected Chromium file missing from rootfs: /${f}"
+			fi
+		done
+		if ! grep -Fq -- '--use-gl=egl' "${SDCARD}/etc/chromium.d/panfrost" || \
+			grep -Fq -- '--use-gl=angle' "${SDCARD}/etc/chromium.d/panfrost"; then
+			exit_with_error "rockchip-multimedia: Chromium must use native EGL, not ANGLE"
+		fi
+		if ! grep -Fq -- '# Z96A_CHROMIUM_CONFIG_BEGIN' "${SDCARD}/usr/lib/chromium/chromium-wrapper" || \
+			! grep -Fq -- '${CHROMIUM_FLAGS}' "${SDCARD}/usr/lib/chromium/chromium-wrapper"; then
+			exit_with_error "rockchip-multimedia: Chromium wrapper does not load /etc/chromium.d"
+		fi
 		for f in "usr/share/rustdesk/rustdesk" "usr/share/rustdesk/lib/librustdesk.so"; do
 			if [[ ! -e "${SDCARD}/${f}" && ! -L "${SDCARD}/${f}" ]]; then
 				exit_with_error "rockchip-multimedia: expected file missing from rootfs: /${f}"

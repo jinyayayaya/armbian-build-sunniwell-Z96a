@@ -3681,7 +3681,7 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <0xc1 0xc2 0xc3 0xc4>;
 		status = "okay";
-		rockchip,clk-trcm = <0x01>;
+		rockchip,trcm-sync-tx-only;
 		phandle = <0xd3>;
 	};
 
