@@ -1,0 +1,60 @@
+name: Build Z96A Rockchip image
+
+on:
+  workflow_dispatch:
+    inputs:
+      armbian_version:
+        description: "Release tag for the generated image (blank uses upstream version)"
+        required: false
+        default: ""
+        type: string
+      armbian_target:
+        description: "Armbian build target"
+        required: false
+        default: build
+        type: choice
+        options:
+          - build
+          - kernel
+
+concurrency:
+  group: z96a-remote-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: z96a-v2 Bookworm XFCE
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out requested revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build Armbian image
+        uses: ./
+        with:
+          armbian_token: ${{ secrets.GITHUB_TOKEN }}
+          armbian_target: ${{ inputs.armbian_target }}
+          armbian_release: bookworm
+          armbian_kernel_branch: legacy
+          armbian_board: z96a-v2
+          armbian_ui: xfce
+          armbian_compress: sha,img,xz
+          armbian_version: ${{ inputs.armbian_version }}
+          armbian_runner_clean: enabled
+          armbian_release_tittle: "Z96A Rockchip Chromium image"
+          armbian_release_body: |
+            Debian Bookworm XFCE image for Sunniwell Z96A v2.
+            Includes Rockchip Chromium with native EGL and V4L2/MPP hardware video decode.
+
+      - name: Upload image artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: z96a-v2-bookworm-xfce
+          path: build/output/images/*
+          if-no-files-found: ignore
+          retention-days: 14

@@ -48,6 +48,18 @@ declare -g EXT_VADRV_GIT="https://github.com/tarcila/libva-rkmpp.git"
 declare -g EXT_VADRV_REF="e69ea1368893cc15c8d59618397ab8d78df648b9"
 declare -g EXT_MOONLIGHT_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/z96a-moonlight-rkmpp.tar.gz"
 declare -g EXT_RUSTDESK_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/rustdesk-1.4.9-rk3568-arm64.deb"
+declare -g EXT_CHROMIUM_ASSET_BASE="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1"
+
+# Rockchip Chromium 111 is paired with libv4l-rkmpp 1.7.0. These packages are
+# published as release assets instead of being checked into the repository.
+declare -g EXT_CHROMIUM_DEB_MANIFEST=(
+	"librockchip-mpp1-dummy.deb|e8ba1de2418bbe32d882bc53936f7a0034d8e6bde5d72d38c2a5528872efe50c"
+	"libv4lconvert0_1.22.1-5_arm64.deb|5bf2872bcca7016a84d114776ab4a18218c62e249da526a614583c1cacb637c5"
+	"libv4l-0_1.22.1-5_arm64.deb|b984dd5a50622f13aafcaef3c9e63a01136734380592c5a8015dfc82453b4391"
+	"libv4l-rkmpp_1.7.0-1_arm64.deb|7a2cb60c87d5625f53aa4903781aaa559534ea49a09ebdf554446e3a3bc55823"
+	"rockchip-chromium-x11-utils_0.2.3_all.deb|ca7f722a41ae4271230062c55a382e459979e23636f7dda9ce44b742bcf42c3b"
+	"chromium-x11_111.0.5563.147_arm64.deb|8ecbdbd8233414c632d3e77e80cf940d2625c4f7c8a2c4d9faf1366a738a6979"
+)
 
 # Fetch `repo_url` at pinned `sha` into `dest_dir` (idempotent).
 function _rockchip_multimedia_fetch_pinned() {
@@ -60,6 +72,60 @@ function _rockchip_multimedia_fetch_pinned() {
 	run_host_command_logged git -C "${dest_dir}" fetch --depth 1 origin "${sha}"
 	run_host_command_logged git -C "${dest_dir}" checkout --detach FETCH_HEAD
 	return 0
+}
+
+# Download a release asset only when it is absent or fails its pinned hash.
+function _rockchip_multimedia_fetch_verified() {
+	local url="${1}" sha256="${2}" destination="${3}"
+	if [[ -f "${destination}" ]] && printf '%s  %s\n' "${sha256}" "${destination}" | sha256sum -c - >/dev/null 2>&1; then
+		return 0
+	fi
+
+	rm -f "${destination}"
+	run_host_command_logged curl -fL --retry 3 -o "${destination}" "${url}"
+	if ! printf '%s  %s\n' "${sha256}" "${destination}" | sha256sum -c -; then
+		exit_with_error "rockchip-multimedia: checksum verification failed for ${url}"
+	fi
+}
+
+function _rockchip_multimedia_patch_chromium_wrapper() {
+	local wrapper="${1}"
+	[[ -f "${wrapper}" ]] || exit_with_error "rockchip-multimedia: Chromium wrapper is missing: ${wrapper}"
+	command -v python3 >/dev/null 2>&1 || exit_with_error "rockchip-multimedia: host python3 is required to patch Chromium wrapper"
+
+	python3 - "${wrapper}" <<-'PY_PATCH_CHROMIUM_WRAPPER'
+		from pathlib import Path
+		import sys
+
+		path = Path(sys.argv[1])
+		text = path.read_text()
+		marker_begin = "# Z96A_CHROMIUM_CONFIG_BEGIN"
+		marker_end = "# Z96A_CHROMIUM_CONFIG_END"
+		old_exec = 'exec -a "$0" "$HERE/chromium-bin" ${CHROME_EXTRA_ARGS} "$@"'
+		new_exec = 'exec -a "$0" "$HERE/chromium-bin" ${CHROME_EXTRA_ARGS} ${CHROMIUM_FLAGS} "$@"'
+		config_hook = '''# Z96A_CHROMIUM_CONFIG_BEGIN
+		CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-}"
+		if [ -d /etc/chromium.d ]; then
+		  for config in /etc/chromium.d/*; do
+		    [ -f "$config" ] && . "$config"
+		  done
+		fi
+		# Z96A_CHROMIUM_CONFIG_END'''
+
+		if marker_begin in text:
+		    start = text.index(marker_begin)
+		    end = text.index(marker_end, start) + len(marker_end)
+		    text = text[:start] + config_hook + text[end:]
+		    if new_exec not in text and old_exec in text:
+		        text = text.replace(old_exec, new_exec, 1)
+		elif old_exec in text:
+		    text = text.replace(old_exec, config_hook + "\n" + new_exec, 1)
+		else:
+		    raise SystemExit("unsupported Chromium wrapper: final exec line not found")
+
+		path.write_text(text)
+	PY_PATCH_CHROMIUM_WRAPPER
+	chmod 0755 "${wrapper}"
 }
 
 # Build host: cross toolchain + build systems for MPP and the VA-API driver.
@@ -118,6 +184,89 @@ function pre_customize_image__rockchip_multimedia_install() {
 
 	display_alert "rockchip-multimedia" "installing MPP/RGA/RKNN userspace (cross prefix: ${prefix})" "info"
 	mkdir -p "${stage}/${lib_dir}" "${stage}/usr/include" "${src_dir}"
+
+	# ------------------------------------------------------- Chromium + V4L2/MPP --
+	# The Debian Chromium build is not compatible with the Rockchip V4L2 bridge.
+	# Install the tested X11 build and its matching libv4l-rkmpp plugin only for
+	# desktop images. Release assets are hash-pinned so a mutable download cannot
+	# silently change the image contents.
+	if [[ "${BUILD_DESKTOP:-}" == "yes" ]]; then
+		[[ "${RELEASE:-}" == "bookworm" ]] || exit_with_error \
+			"rockchip-multimedia: Rockchip Chromium assets require Debian bookworm"
+		local chromium_deb_dir="${work_dir}/chromium"
+		local chromium_manifest chromium_name chromium_sha chromium_deb
+		mkdir -p "${chromium_deb_dir}"
+
+		for chromium_manifest in "${EXT_CHROMIUM_DEB_MANIFEST[@]}"; do
+			IFS='|' read -r chromium_name chromium_sha <<< "${chromium_manifest}"
+			chromium_deb="${chromium_deb_dir}/${chromium_name}"
+			_rockchip_multimedia_fetch_verified \
+				"${EXT_CHROMIUM_ASSET_BASE}/${chromium_name}" \
+				"${chromium_sha}" "${chromium_deb}"
+		done
+
+		# These dependencies are not pulled by the old Debian Chromium package
+		# metadata but are required by the Rockchip build at runtime.
+		chroot_sdcard apt-get update -o Acquire::Check-Valid-Until=false
+		chroot_sdcard apt-get install -y --no-install-recommends \
+			libc++1 libgdk-pixbuf2.0-bin libjsoncpp25
+
+		# chromium-x11 declares Conflicts against all Debian Chromium package
+		# names. Purge any package inherited from a desktop base image first.
+		for chromium_package in chromium chromium-common chromium-sandbox chromium-l10n chromium-browser chromium-browser-l10n chromium-codecs-ffmpeg-extra; do
+			if chroot_sdcard dpkg-query -W -f='${Status}' "${chromium_package}" 2>/dev/null | grep -qx 'install ok installed'; then
+				chroot_sdcard apt-get purge -y "${chromium_package}"
+			fi
+		done
+
+		# Install the dummy dependency before libv4l-rkmpp. It intentionally does
+		# not ship a library: the board's MPP extension installs the newer library.
+		local chromium_install_order=(
+			"librockchip-mpp1-dummy.deb"
+			"libv4lconvert0_1.22.1-5_arm64.deb"
+			"libv4l-0_1.22.1-5_arm64.deb"
+			"libv4l-rkmpp_1.7.0-1_arm64.deb"
+			"rockchip-chromium-x11-utils_0.2.3_all.deb"
+			"chromium-x11_111.0.5563.147_arm64.deb"
+		)
+		for chromium_name in "${chromium_install_order[@]}"; do
+			install_deb_chroot "${chromium_deb_dir}/${chromium_name}"
+		done
+
+		mkdir -p "${SDCARD}/etc/chromium.d" "${SDCARD}/usr/lib/libv4l"
+		cat > "${SDCARD}/etc/chromium.d/panfrost" <<-'EOF'
+			# RK3568 Chromium: native EGL is required by the V4L2/MPP video path.
+			export CHROMIUM_FLAGS="$CHROMIUM_FLAGS \
+			  --use-gl=egl \
+			  --ignore-gpu-blocklist \
+			  --enable-gpu-rasterization \
+			  --enable-zero-copy \
+			  --disable-features=Translate,OptimizationHints \
+			  --disable-sync \
+			  --disable-background-networking \
+			  --disable-component-update \
+			  --disable-domain-reliability \
+			  --disable-breakpad \
+			  --disable-crash-reporter \
+			  --process-per-site \
+			  --no-first-run \
+			  --no-default-browser-check \
+			  --disk-cache-size=104857600 \
+			  --media-cache-size=104857600"
+		EOF
+		chmod 0644 "${SDCARD}/etc/chromium.d/panfrost"
+
+		# chromium-bin looks for libv4l2.so and the plugin in legacy paths.
+		ln -sfn /usr/lib/aarch64-linux-gnu/libv4l/plugins "${SDCARD}/usr/lib/libv4l/plugins"
+		ln -sfnT lib "${SDCARD}/usr/lib64"
+		_rockchip_multimedia_patch_chromium_wrapper "${SDCARD}/usr/lib/chromium/chromium-wrapper"
+
+		# The package's service creates /dev/video-dec0 and /dev/video-enc0 at
+		# graphical.target, where the desktop Chromium process can access them.
+		mkdir -p "${SDCARD}/etc/systemd/system/graphical.target.wants"
+		ln -sfn /lib/systemd/system/rockchip-chromium-x11-utils.service \
+			"${SDCARD}/etc/systemd/system/graphical.target.wants/rockchip-chromium-x11-utils.service"
+	fi
 
 	# ------------------------------------------------------------------ MPP --
 	# NOTE: upstream develop names the library with an underscore:
@@ -290,7 +439,11 @@ function pre_customize_image__rockchip_multimedia_install() {
 		if [[ -f "${SDCARD}/usr/share/rustdesk/files/systemd/rustdesk.service" ]]; then
 			mkdir -p "${SDCARD}/usr/lib/systemd/system"
 			cp -f "${SDCARD}/usr/share/rustdesk/files/systemd/rustdesk.service" "${SDCARD}/usr/lib/systemd/system/rustdesk.service"
-			chroot_sdcard systemctl enable rustdesk || true
+			# RustDesk is available on demand but must not start automatically.
+			chroot_sdcard systemctl disable rustdesk 2>/dev/null || true
+			for target in multi-user graphical default; do
+				rm -f "${SDCARD}/etc/systemd/system/${target}.target.wants/rustdesk.service"
+			done
 		fi
 		if [[ ! -e "${SDCARD}/usr/bin/rustdesk" && ! -L "${SDCARD}/usr/bin/rustdesk" ]]; then
 			ln -sf /usr/share/rustdesk/rustdesk "${SDCARD}/usr/bin/rustdesk"
