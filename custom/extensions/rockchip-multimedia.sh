@@ -49,6 +49,11 @@ declare -g EXT_VADRV_REF="e69ea1368893cc15c8d59618397ab8d78df648b9"
 declare -g EXT_MOONLIGHT_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/z96a-moonlight-rkmpp.tar.gz"
 declare -g EXT_RUSTDESK_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1/rustdesk-1.4.9-rk3568-arm64.deb"
 declare -g EXT_CHROMIUM_ASSET_BASE="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/26.5.1"
+# This is the AArch64 bundle already verified on the Z96A. Keep both the
+# release and digest fixed so image builds do not depend on a mutable asset.
+declare -g EXT_MPV_RKMPP_VERSION="26.5.2"
+declare -g EXT_MPV_RKMPP_URL="https://github.com/jinyayayaya/armbian-build-sunniwell-Z96a/releases/download/${EXT_MPV_RKMPP_VERSION}/z96a-mpv-rkmpp.tar.gz"
+declare -g EXT_MPV_RKMPP_SHA256="0a492aedafb6e8349ed92e0a06071457cd97e8eb27a8b869f4eac0018e99a588"
 
 # Rockchip Chromium 111 is paired with libv4l-rkmpp 1.7.0. These packages are
 # published as release assets instead of being checked into the repository.
@@ -138,8 +143,13 @@ function post_family_config__rockchip_multimedia_gles_packages() {
 	display_alert "rockchip-multimedia" "adding Mesa GLES userspace packages" "info"
 	# Mesa Panfrost provides EGL/GLES3.1; libgl1-mesa-dri ships the gallium drivers.
 	# libva2/libva-drm2 runtime + vainfo for the VA-API->MPP decode path.
-	# mpv video player with VA-API hardware decode support.
-	add_packages_to_image libegl1 libgles2 libgl1-mesa-dri libva2 libva-drm2 vainfo mpv
+	# mpv itself is the pinned RKMPP bundle installed below, not Debian's mpv.
+	add_packages_to_image \
+		libasound2 libass9 libdrm2 libegl1 libfontconfig1 libfreetype6 libgbm1 \
+		libgl1 libgles2 libpulse0 libva2 libva-drm2 libx11-6 libxcb1 libxext6 \
+		libxfixes3 libxpresent1 libxrandr2 libxss1 libxv1 libfribidi0 \
+		libharfbuzz0b libglib2.0-0 libgcc-s1 libstdc++6 libxrender1 \
+		libgl1-mesa-dri vainfo
 	if [[ "${BUILD_MINIMAL:-}" != "yes" ]]; then
 		add_packages_to_image glmark2-es2 # on-device GLES sanity check
 	fi
@@ -172,6 +182,8 @@ function _rockchip_multimedia_cross_prefix() {
 
 function pre_customize_image__rockchip_multimedia_install() {
 	[[ "${BOARDFAMILY:-}" != "rockchip-rk3568-z96a" ]] && return 0
+	[[ "${RELEASE:-}" == "bookworm" ]] || exit_with_error \
+		"rockchip-multimedia: pinned RKMPP mpv bundle requires Debian bookworm"
 
 	local lib_dir="usr/lib/aarch64-linux-gnu"
 	local work_dir="${SRC}/output/rockchip-multimedia"
@@ -428,6 +440,42 @@ function pre_customize_image__rockchip_multimedia_install() {
 		display_alert "rockchip-multimedia" "Moonlight already staged, reusing" "debug"
 	fi
 
+	# -------------------------------------------------------- RKMPP mpv bundle --
+	# The bundle was built and tested separately on AArch64. Downloading it here
+	# keeps normal image builds fast and avoids rebuilding FFmpeg/mpv under QEMU.
+	local mpv_tar="${work_dir}/z96a-mpv-rkmpp.tar.gz"
+	local mpv_root="${SDCARD}/opt/z96a-mpv-rkmpp"
+	display_alert "rockchip-multimedia" "fetching pinned RKMPP mpv ${EXT_MPV_RKMPP_VERSION}" "info"
+	_rockchip_multimedia_fetch_verified \
+		"${EXT_MPV_RKMPP_URL}" \
+		"${EXT_MPV_RKMPP_SHA256}" \
+		"${mpv_tar}"
+	run_host_command_logged rm -rf "${mpv_root}"
+	run_host_command_logged mkdir -p "${SDCARD}/opt"
+	run_host_command_logged tar --no-same-owner --no-same-permissions -xzf "${mpv_tar}" -C "${SDCARD}/opt"
+	if [[ ! -x "${mpv_root}/bin/mpv" || ! -f "${mpv_root}/config/mpv.conf" ]]; then
+		exit_with_error "rockchip-multimedia: downloaded RKMPP mpv bundle is incomplete"
+	fi
+
+	# Remove any distro mpv that may have entered the rootfs through a desktop
+	# app group. The image must not retain the old software-decoder binary.
+	chroot_sdcard apt-get purge -y mpv >/dev/null 2>&1 || true
+	run_host_command_logged rm -f \
+		"${SDCARD}/usr/bin/mpv.real" \
+		"${SDCARD}/usr/local/bin/mpv.bin" \
+		"${SDCARD}/etc/mpv/mpv.conf"
+
+	# Reuse the bundle's desktop entry and icons; Exec=mpv resolves to the SMB
+	# wrapper installed by the board hook below.
+	if [[ -f "${mpv_root}/share/applications/mpv.desktop" ]]; then
+		run_host_command_logged mkdir -p "${SDCARD}/usr/share/applications"
+		run_host_command_logged cp -a "${mpv_root}/share/applications/mpv.desktop" "${SDCARD}/usr/share/applications/"
+	fi
+	if [[ -d "${mpv_root}/share/icons/hicolor" ]]; then
+		run_host_command_logged mkdir -p "${SDCARD}/usr/share/icons/hicolor"
+		run_host_command_logged cp -a "${mpv_root}/share/icons/hicolor/." "${SDCARD}/usr/share/icons/hicolor/"
+	fi
+
 	# --------------------------------------------- RustDesk (RKMPP accelerated) --
 	if [[ "${BUILD_DESKTOP:-}" == "yes" && ! -e "${SDCARD}/usr/share/rustdesk/rustdesk" ]]; then
 		display_alert "rockchip-multimedia" "fetching and installing RustDesk RKMPP" "info"
@@ -471,29 +519,6 @@ function pre_customize_image__rockchip_multimedia_install() {
 		echo 'LIBVA_DRIVER_NAME=rockchip' >> "${SDCARD}/etc/environment"
 		echo 'MOZ_DISABLE_RDD_SANDBOX=1' >> "${SDCARD}/etc/environment"
 	fi
-
-	# mpv hardware decoding & network streaming configuration
-	mkdir -p "${SDCARD}/etc/mpv"
-	cat > "${SDCARD}/etc/mpv/mpv.conf" <<- 'EOF'
-		# Sunniwell Z96A (RK3568) MPV Hardware Acceleration Configuration
-		vo=gpu
-		gpu-context=x11egl
-		hwdec=auto
-		hwdec-codecs=all
-
-		# Performance & Display
-		video-sync=display-resample
-		interpolation=no
-		dither-depth=auto
-
-		# Audio Output
-		ao=pulse,alsa
-
-		# Network & Cache (Smooth playback over Samba / LAN / Wi-Fi)
-		demuxer-max-bytes=64MiB
-		demuxer-max-back-bytes=32MiB
-		force-seekable=yes
-	EOF
 
 	# Firefox-esr prefs (only when firefox-esr is present in this image).
 	local ff_pref_dir="${SDCARD}/usr/lib/firefox-esr/defaults/pref"
@@ -558,7 +583,12 @@ function pre_umount_final_image__rockchip_multimedia_verify() {
 		"${lib_dir}/dri/rockchip_drv_video.so" \
 		"etc/udev/rules.d/60-rockchip-multimedia.rules" \
 		"etc/profile.d/rockchip-vaapi.sh" \
-		"etc/mpv/mpv.conf" \
+		"opt/z96a-mpv-rkmpp/bin/mpv" \
+		"opt/z96a-mpv-rkmpp/bin/mpv.bin" \
+		"opt/z96a-mpv-rkmpp/config/mpv.conf" \
+		"opt/z96a-mpv-rkmpp/share/build-manifest.txt" \
+		"usr/local/bin/mpv" \
+		"usr/bin/mpv" \
 		"usr/local/bin/moonlight" \
 		"usr/local/bin/moonlight-qt-wrapper" \
 		"opt/ffmpeg-rockchip/lib/libavcodec.so.60" \
@@ -567,6 +597,9 @@ function pre_umount_final_image__rockchip_multimedia_verify() {
 			exit_with_error "rockchip-multimedia: expected file missing from rootfs: /${f}"
 		fi
 	done
+	if [[ -e "${SDCARD}/usr/bin/mpv.real" || -e "${SDCARD}/usr/local/bin/mpv.bin" || -e "${SDCARD}/etc/mpv/mpv.conf" ]]; then
+		exit_with_error "rockchip-multimedia: obsolete Debian mpv files remain in rootfs"
+	fi
 
 	if [[ "${BUILD_DESKTOP:-}" == "yes" ]]; then
 		for f in "usr/share/rustdesk/rustdesk" "usr/share/rustdesk/lib/librustdesk.so"; do
